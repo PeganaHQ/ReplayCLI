@@ -29,11 +29,18 @@ name        = "pegana-replay"
 # "verify it yourself" remediation was broken for the common mismatch case. Docs-
 # /hint-only; no methodology, receipt-schema, or verify behavior change (still
 # embeds methodology 0.7.0, exact-match per ADR-0028).
-version     = "0.5.1"
+# v0.5.2 (2026-07-30): --json emits ONE machine-readable verdict on stdout
+# ({status, exit_code, alert_id, methodology_version, receipt_sha256, onchain})
+# at every terminal point, and PASS/FAIL is colored on TTYs (honors NO_COLOR).
+# Purely additive: exit codes 0-5 and the verify path are untouched, and it
+# still embeds methodology 0.7.0 (exact-match per ADR-0028), so 0.5.1 and 0.5.2
+# verify exactly the same receipts. Cut as 0.5.2 rather than re-tagging 0.5.1
+# because 0.5.1 is already published to crates.io WITHOUT --json.
+version     = "0.5.2"
 edition     = "2021"
 description = "Recomputes a Pegana alert receipt's canonical SHA-256 and, by default, cross-checks its on-chain SPL Memo anchor against a pinned signer (skip via --offline); re-derives the verdict from frozen inputs for schema-v2 receipts."
 license     = "MIT"
-repository  = "https://github.com/lrafasouza/pegana-replay"
+repository  = "https://github.com/PeganaHQ/ReplayCLI"
 keywords    = ["pegana", "audit", "verify", "solana"]
 categories  = ["command-line-utilities"]
 

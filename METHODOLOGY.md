@@ -267,17 +267,19 @@ The CLI:
    canonical hash; checks the anchoring transaction was signed by a
    pinned Pegana ops key.
 5. Exits 0 (PASS) iff both conditions hold: the hash matches and
-   (when `--verify-onchain`) the on-chain anchor is signed by an
-   accepted Pegana commit wallet.
+   (unless `--offline`) the on-chain anchor is signed by an accepted
+   Pegana commit wallet. On-chain verification is on by default;
+   `--offline` runs the hash check alone. Add `--json` for a single
+   machine-readable verdict line on stdout — the exit code is unchanged.
 
 Note: the CLI does NOT re-execute the methodology or re-derive the
 verdict from raw market data — that is ADR-0019's documented design.
 It provides tamper-evidence: anyone can confirm the published history
 wasn't altered.
 
-This is offline after step 1. The replay binary doesn't need
-network access for the math — only to fetch the receipt and (with
-`--verify-onchain`) confirm the SPL Memo commitment.
+The replay binary doesn't need network access for the math — only to
+fetch the receipt and (unless `--offline`) confirm the SPL Memo
+commitment on-chain.
 
 ### On-chain commitment
 

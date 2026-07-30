@@ -684,3 +684,80 @@ async fn onchain_memo_mismatch_still_gives_exit4() {
         "stderr: {stderr}"
     );
 }
+
+// ── --json: one machine-readable verdict line on stdout (for CI) ─────────────
+// The exit code is unchanged from human mode (asserted above across 0-5); these
+// only prove the JSON shape + that human text no longer leaks to stdout.
+
+#[test]
+fn json_pass_emits_verdict_on_stdout() {
+    let receipt = synth_receipt(); // v1, Drift
+    let file = write_bundle(&receipt);
+    let output = Command::new(env!("CARGO_BIN_EXE_pegana-replay"))
+        .arg("--bundle")
+        .arg(file.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json stdout must be ONE JSON line: {e}; got: {stdout}"));
+    assert_eq!(v["status"], "pass");
+    assert_eq!(v["exit_code"], 0);
+    assert_eq!(v["asset"], "USDC");
+    assert_eq!(v["final_state"], "Drift");
+    assert_eq!(v["methodology_version"], methodology_version());
+    assert_eq!(v["receipt_sha256"], receipt.expected_receipt_sha256);
+    // Human PASS text must NOT leak to stdout in json mode.
+    assert!(
+        !stdout.contains("PASS "),
+        "json mode must not print the human PASS line; got: {stdout}"
+    );
+}
+
+#[test]
+fn json_fail_emits_verdict_on_tamper() {
+    let mut receipt = synth_receipt();
+    receipt.inputs_frozen.market_usd = Decimal::from_str("0.50").unwrap();
+    let file = write_bundle(&receipt);
+    let output = Command::new(env!("CARGO_BIN_EXE_pegana-replay"))
+        .arg("--bundle")
+        .arg(file.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json stdout must be JSON: {e}; got: {stdout}"));
+    assert_eq!(v["status"], "fail");
+    assert_eq!(v["exit_code"], 1);
+    assert!(
+        !stdout.contains("FAIL"),
+        "json mode must not print the human FAIL text on stdout; got: {stdout}"
+    );
+}
+
+#[test]
+fn json_version_mismatch_emits_verdict() {
+    let mut receipt = synth_receipt();
+    receipt.methodology_version = "0.0.0-bogus-test-version".into();
+    let file = write_bundle(&receipt);
+    let output = Command::new(env!("CARGO_BIN_EXE_pegana-replay"))
+        .arg("--bundle")
+        .arg(file.path())
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("--json stdout must be JSON: {e}; got: {stdout}"));
+    assert_eq!(v["status"], "version_mismatch");
+    assert_eq!(v["exit_code"], 3);
+}

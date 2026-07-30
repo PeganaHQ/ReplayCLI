@@ -29,7 +29,12 @@ on-chain anchor (severe transitions), also verifies that anchor + its signer
 a false PASS. For a hash-only check — CI, air-gapped hosts, or you just want it
 fast — add
 `--offline`, or verify a saved bundle entirely offline:
-`pegana-replay --bundle <path-to-replay-bundle.json>`.
+`pegana-replay --bundle <path-to-replay-bundle.json>`. For CI or scripting, add
+`--json` for a single machine-readable verdict line on stdout (`status` +
+`exit_code` + the receipt's frozen `asset` / `final_state` /
+`methodology_version` / `receipt_sha256`); the exit code is unchanged. An
+interactive run also colors PASS green / FAIL red (honors `NO_COLOR` and stays
+plain when piped).
 
 **Option B — no install, verify in your browser:**
 Open the audit page for any alert — `https://www.pegana.xyz/audit/<alert-id>` — where the in-browser
@@ -86,10 +91,16 @@ pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789
 # 3. Hash-only, no RPC call (CI, air-gapped hosts):
 pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789 --offline
 
+# 3b. Machine-readable verdict for CI / scripting — one JSON line to stdout,
+#     exit code unchanged; combine with --offline for a no-RPC check:
+pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789 --json
+# → {"status":"PASS","exit_code":0,"asset":"jitoSOL","previous_state":"Pegged",
+#    "final_state":"Pegged","methodology_version":"0.7.0","receipt_sha256":"…","alert_id":"…"}
+
 # 4. Verify the binary's provenance via the Sigstore attestation issued
 #    by this repo's CI (linux-x86_64 / darwin-aarch64 release binaries).
 gh attestation verify ~/.pegana/bin/pegana-replay \
-  --repo lrafasouza/pegana-replay
+  --repo PeganaHQ/ReplayCLI
 ```
 
 ## Versioning

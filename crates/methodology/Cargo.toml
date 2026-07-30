@@ -4,7 +4,7 @@ version     = "0.7.0"
 edition     = "2021"
 description = "Pure, versioned methodology functions for Pegana's peg-risk engine. Used by the engine at runtime and by pegana-replay-cli for offline verification."
 license     = "MIT"
-repository  = "https://github.com/lrafasouza/pegana-replay"
+repository  = "https://github.com/PeganaHQ/ReplayCLI"
 
 [dependencies]
 # Verifier-safe carve-out of pegana-common. Engine + other private crates

@@ -51,7 +51,7 @@
 //!              is used without --offline.)
 
 use anyhow::{anyhow, bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches, Parser};
 use pegana_common_verify::PegState;
 use pegana_methodology::{
     canonical_assets_hash, canonical_receipt_hash, hex_sha256, methodology_version, rederive,
@@ -81,11 +81,126 @@ use uuid::Uuid;
 /// pulling and rebuilding.
 const PEGANA_COMMIT_SIGNERS: &[&str] = &["7PpoyumFQMmcWzhJxDYr6iPv1fjYN41KBTA8xKKzu7R9"];
 
+/// The exit-code table, surfaced in `--help` (`after_long_help`) so CI authors
+/// can script against the verifier without reading the source. Mirrors the
+/// module-level doc-comment above and ADR-0033.
+const EXIT_CODES_HELP: &str = "\
+EXIT CODES:
+  0  PASS                hash matches (with --alert-id, minus --offline, the
+                         on-chain anchor + pinned signer also matched)
+  1  FAIL                receipt sha256 / v2 re-derivation mismatch (tamper)
+  2  ERROR               network, bundle, or CLI-usage error
+  3  VERSION_MISMATCH    install the build embedding the receipt's methodology
+  4  ONCHAIN_MISMATCH    wrong/absent signer, no memo, or memo content mismatch
+  5  ONCHAIN_INCOMPLETE  on-chain check couldn't complete (RPC down, anchor still
+                         within its 24h commit window, or commit disabled at emit)";
+
+/// Which published CLI build embeds a given receipt `methodology_version`.
+///
+/// The CLI version is deliberately decoupled from the methodology it embeds,
+/// and `verify()` is an exact-match check with no in-binary multi-version
+/// dispatch (ADR-0028) — so a user hitting VERSION_MISMATCH needs one specific
+/// published build, not a version list to browse. Every entry here is a real
+/// crates.io release; the current methodology is served by the latest release
+/// and so is deliberately absent.
+///
+/// `None` means no published artifact can verify that receipt: the three crates
+/// were first published on 2026-07-01, at methodology 0.4.0, so receipts older
+/// than that predate every published build. Saying so plainly beats sending
+/// someone to a version list that cannot contain what they need.
+///
+/// # Why every emitted command carries `--locked`
+///
+/// The CLI depends on the methodology crate with a caret requirement, so a bare
+/// `cargo install pegana-replay@0.4.3` RE-RESOLVES `^0.6.0` to the newest 0.6.x
+/// — methodology 0.6.1 — and then fails the exact-match check it was supposed to
+/// fix. The packaged `Cargo.lock` carries the true pin (0.6.0), but `cargo
+/// install` only honours it under `--locked`. Verified against crates.io on
+/// 2026-07-30. Dropping the flag silently breaks the 0.6.0 mapping.
+const CLI_BUILD_FOR_METHODOLOGY: &[(&str, &str)] = &[
+    ("0.4.0", "0.4.1"),
+    ("0.5.0", "0.4.2"),
+    ("0.6.0", "0.4.3"),
+    ("0.6.1", "0.4.4"),
+];
+
+/// The published CLI build embedding `methodology_ver`, if one exists.
+fn cli_build_for_methodology(methodology_ver: &str) -> Option<&'static str> {
+    CLI_BUILD_FOR_METHODOLOGY
+        .iter()
+        .find(|(m, _)| *m == methodology_ver)
+        .map(|(_, cli)| *cli)
+}
+
+/// Parse a `major.minor.patch` version into a comparable tuple. Returns `None`
+/// on anything that isn't three numeric components, so callers fall back to the
+/// conservative branch rather than guessing.
+fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((major, minor, patch))
+}
+
+/// The remediation line printed on VERSION_MISMATCH (exit 3).
+///
+/// Three cases: a known historical receipt gets an exact pin; a receipt newer
+/// than this build means the user is behind and should update; anything else
+/// predates the first publish and is honestly reported as unverifiable from
+/// published artifacts.
+fn version_mismatch_hint(receipt_ver: &str, embedded_ver: &str) -> String {
+    if let Some(cli) = cli_build_for_methodology(receipt_ver) {
+        return format!(
+            "Install the build that embeds methodology v{receipt_ver}:\n  \
+             cargo install pegana-replay@{cli} --locked\n  \
+             # --locked is required: without it cargo re-resolves the methodology \
+             dependency to a newer patch and the exact-match check fails again."
+        );
+    }
+    match (parse_semver(receipt_ver), parse_semver(embedded_ver)) {
+        (Some(r), Some(e)) if r > e => format!(
+            "This receipt is NEWER than your CLI (methodology v{receipt_ver} vs v{embedded_ver}).\n  \
+             cargo install pegana-replay --locked          # update to the latest release"
+        ),
+        _ => format!(
+            "No published build embeds methodology v{receipt_ver}. The verifier crates were first \
+             published on 2026-07-01 at methodology 0.4.0, so this receipt predates every published \
+             artifact and cannot be verified from crates.io. Its hash and on-chain anchor are still \
+             intact — see https://pegana.xyz/methodology for the version history."
+        ),
+    }
+}
+
+/// `--version` (long form): the CLI crate version PLUS the methodology version
+/// this build embeds and the count of pinned ops signers. The embedded
+/// methodology version is the identity `verify()` exact-matches against a
+/// receipt (ADR-0028), so a user hitting VERSION_MISMATCH (exit 3) can run
+/// `pegana-replay --version` to see exactly which methodology this build
+/// verifies. (`-V` still prints just the short CLI version.)
+fn long_version_string() -> String {
+    format!(
+        "{cli} (embeds methodology {method}; {n} pinned commit signer{s})",
+        cli = env!("CARGO_PKG_VERSION"),
+        method = methodology_version(),
+        n = PEGANA_COMMIT_SIGNERS.len(),
+        s = if PEGANA_COMMIT_SIGNERS.len() == 1 {
+            ""
+        } else {
+            "s"
+        },
+    )
+}
+
 /// Verify a Pegana alert against its published receipt.
 #[derive(Parser, Debug)]
 #[command(
     version,
     about,
+    after_long_help = EXIT_CODES_HELP,
     long_about = "Verify a Pegana alert against its published receipt.\n\n\
         Always checks: the receipt's canonical SHA-256, recomputed from its \
         frozen inputs, matches the hash the API/bundle claims (proves \
@@ -134,6 +249,74 @@ struct Cli {
     /// Suppress all output except final PASS/FAIL.
     #[arg(long)]
     quiet: bool,
+
+    /// Emit ONE machine-readable JSON verdict on stdout instead of human text
+    /// (for CI). Shape: `{status, exit_code, asset?, final_state?,
+    /// methodology_version?, receipt_sha256?, onchain_tx?, message?}`. The
+    /// process still exits with the same code (0/1/2/3/4/5) — the JSON just
+    /// makes the verdict scriptable without scraping stdout.
+    #[arg(long)]
+    json: bool,
+}
+
+/// Print one JSON verdict line to stdout and exit with `exit_code`. Used only in
+/// `--json` mode; it never changes WHICH code is returned (the exit semantics
+/// are identical to human mode), it only serialises the outcome for CI.
+fn emit_json_and_exit(
+    status: &str,
+    exit_code: i32,
+    receipt: Option<&Receipt>,
+    alert_id: Option<&Uuid>,
+    onchain_tx: Option<&str>,
+    message: Option<&str>,
+) -> ! {
+    let mut obj = serde_json::json!({ "status": status, "exit_code": exit_code });
+    let m = obj.as_object_mut().expect("json object");
+    if let Some(r) = receipt {
+        m.insert("asset".into(), r.inputs_frozen.asset.clone().into());
+        m.insert(
+            "previous_state".into(),
+            format!("{:?}", r.inputs_frozen.previous_state).into(),
+        );
+        m.insert(
+            "final_state".into(),
+            format!("{:?}", r.expected_computed.final_state).into(),
+        );
+        m.insert(
+            "methodology_version".into(),
+            r.methodology_version.clone().into(),
+        );
+        m.insert(
+            "receipt_sha256".into(),
+            r.expected_receipt_sha256.clone().into(),
+        );
+    }
+    if let Some(id) = alert_id {
+        m.insert("alert_id".into(), id.to_string().into());
+    }
+    if let Some(tx) = onchain_tx {
+        m.insert("onchain_tx".into(), tx.to_string().into());
+    }
+    if let Some(msg) = message {
+        m.insert("message".into(), msg.to_string().into());
+    }
+    println!(
+        "{}",
+        serde_json::to_string(&obj).expect("serialize verdict")
+    );
+    std::process::exit(exit_code);
+}
+
+/// Bold-ANSI-paint `s` with SGR color `code` ("32" green / "31" red /
+/// "33" yellow) when stdout is a TTY and `NO_COLOR` is unset; plain otherwise.
+/// So `pegana-replay | cat` and CI logs stay clean, an interactive run pops.
+fn paint(s: &str, code: &str) -> String {
+    use std::io::IsTerminal;
+    if std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none() {
+        format!("\x1b[1;{code}m{s}\x1b[0m")
+    } else {
+        s.to_string()
+    }
 }
 
 /// The engine anchors on-chain ONLY for high-severity transitions
@@ -193,7 +376,15 @@ async fn main() {
 }
 
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    // Parse via the builder so `--version` reports BOTH the CLI crate version
+    // AND the methodology version it embeds (the pair a VERSION_MISMATCH points
+    // to). All derived args/conflicts/help are preserved via `Cli::command()`.
+    // clap's `long_version` wants a `&'static str`; leak the runtime string once
+    // (it lives for the process lifetime regardless, and `--version` exits right
+    // after printing it).
+    let long_version: &'static str = Box::leak(long_version_string().into_boxed_str());
+    let matches = Cli::command().long_version(long_version).get_matches();
+    let cli = Cli::from_arg_matches(&matches).map_err(|e| anyhow!("{e}"))?;
 
     if cli.verify_onchain && !cli.quiet {
         eprintln!(
@@ -202,56 +393,130 @@ async fn run() -> Result<()> {
         );
     }
 
-    let receipt: Receipt = match (&cli.alert_id, &cli.bundle) {
-        (Some(id), _) => fetch_bundle(&cli.api_url, *id).await?,
-        (None, Some(path)) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read bundle {}", path.display()))?;
-            serde_json::from_str(&text).context("parse bundle JSON")?
+    // Resolve the receipt. Any fetch/read/parse/usage failure is an ERROR
+    // (exit 2) — one JSON line in --json mode, human text otherwise.
+    let receipt: Receipt = match resolve_receipt(&cli).await {
+        Ok(r) => r,
+        Err(e) => {
+            if cli.json {
+                emit_json_and_exit(
+                    "error",
+                    2,
+                    None,
+                    cli.alert_id.as_ref(),
+                    None,
+                    Some(&format!("{e:#}")),
+                );
+            }
+            eprintln!("{}  {e:#}", paint("ERROR", "31"));
+            std::process::exit(2);
         }
-        (None, None) => bail!("provide either --alert-id <UUID> or --bundle <path>"),
     };
 
-    verify(&receipt, cli.quiet)?; // exits 1 directly on hash/re-derive mismatch
+    // Hash + re-derivation check. Exits 1 (tamper) / 3 (version) internally
+    // (json-aware). An Err here is ERROR-class (unsupported schema, hash-compute
+    // or re-derive error) → exit 2.
+    if let Err(e) = verify(&receipt, cli.quiet, cli.json) {
+        if cli.json {
+            emit_json_and_exit(
+                "error",
+                2,
+                Some(&receipt),
+                cli.alert_id.as_ref(),
+                None,
+                Some(&format!("{e:#}")),
+            );
+        }
+        eprintln!("{}  {e:#}", paint("ERROR", "31"));
+        std::process::exit(2);
+    }
 
-    // On-chain verification is the default for --alert-id (v0.5.0+, was
-    // opt-in via --verify-onchain before). --offline skips it explicitly;
-    // --bundle mode has no alert_id to look an anchor up with, so it is
-    // always offline regardless of the flag.
-    match (&cli.alert_id, cli.offline) {
+    // On-chain anchor check — the default for --alert-id unless --offline.
+    // --bundle carries no alert_id, so it is always offline.
+    let onchain_tx: Option<String> = match (&cli.alert_id, cli.offline) {
         (Some(id), false) => {
-            if let Err(e) =
-                verify_onchain(&cli.api_url, &cli.solana_rpc, *id, &receipt, cli.quiet).await
+            match verify_onchain(
+                &cli.api_url,
+                &cli.solana_rpc,
+                *id,
+                &receipt,
+                cli.quiet,
+                cli.json,
+            )
+            .await
             {
-                eprintln!("ONCHAIN_INCOMPLETE  {e:#}");
-                eprintln!(
-                    "  This is NOT a mismatch — the on-chain check could not be completed \
-                     (network/RPC issue, or the anchor isn't committed yet). The hash result \
-                     above still stands as tamper-evidence. Retry, check --solana-rpc / \
-                     --api-url, or pass --offline to skip this check."
-                );
-                std::process::exit(5);
+                Ok(tx) => tx,
+                Err(e) => {
+                    if cli.json {
+                        emit_json_and_exit(
+                            "onchain_incomplete",
+                            5,
+                            Some(&receipt),
+                            Some(id),
+                            None,
+                            Some(&format!("{e:#}")),
+                        );
+                    }
+                    eprintln!("{}  {e:#}", paint("ONCHAIN_INCOMPLETE", "33"));
+                    eprintln!(
+                        "  This is NOT a mismatch — the on-chain check could not be completed \
+                         (network/RPC issue, or the anchor isn't committed yet). The hash result \
+                         above still stands as tamper-evidence. Retry, check --solana-rpc / \
+                         --api-url, or pass --offline to skip this check."
+                    );
+                    std::process::exit(5);
+                }
             }
         }
         (Some(_), true) => {
-            if !cli.quiet {
+            if !cli.json && !cli.quiet {
                 eprintln!(
                     "Note: on-chain check skipped (--offline). PASS above is hash-only \
                      tamper-evidence; it does not confirm the on-chain anchor."
                 );
             }
+            None
         }
         (None, _) => {
-            if !cli.quiet {
+            if !cli.json && !cli.quiet {
                 eprintln!(
                     "Note: on-chain check not available for --bundle (no alert_id to look \
                      up an anchor for). PASS above is hash-only tamper-evidence."
                 );
             }
+            None
         }
+    };
+
+    // Success. In --json mode emit the single PASS verdict now (with the on-chain
+    // tx when one was verified); the human PASS lines were already printed above.
+    if cli.json {
+        emit_json_and_exit(
+            "pass",
+            0,
+            Some(&receipt),
+            cli.alert_id.as_ref(),
+            onchain_tx.as_deref(),
+            None,
+        );
     }
 
     Ok(())
+}
+
+/// Resolve the receipt from `--alert-id` (API) or `--bundle` (local file). A
+/// bad URL/file/JSON or missing input is an Err (surfaced by the caller as an
+/// ERROR exit 2, in json or human form).
+async fn resolve_receipt(cli: &Cli) -> Result<Receipt> {
+    match (&cli.alert_id, &cli.bundle) {
+        (Some(id), _) => fetch_bundle(&cli.api_url, *id).await,
+        (None, Some(path)) => {
+            let text = std::fs::read_to_string(path)
+                .with_context(|| format!("read bundle {}", path.display()))?;
+            serde_json::from_str(&text).context("parse bundle JSON")
+        }
+        (None, None) => bail!("provide either --alert-id <UUID> or --bundle <path>"),
+    }
 }
 
 async fn fetch_bundle(api_url: &str, alert_id: Uuid) -> Result<Receipt> {
@@ -270,8 +535,10 @@ async fn fetch_bundle(api_url: &str, alert_id: Uuid) -> Result<Receipt> {
     Ok(receipt)
 }
 
-fn verify(receipt: &Receipt, quiet: bool) -> Result<()> {
+fn verify(receipt: &Receipt, quiet: bool, json: bool) -> Result<()> {
     // 1) Schema version — accept v1 (re-hash only) and v2 (re-hash + re-derive).
+    // (Unsupported schema / hash-compute / re-derive-error bail out as Err →
+    //  run() reports them as ERROR exit 2, in json or human form.)
     if !matches!(receipt.schema_version.as_str(), "v1" | "v2") {
         bail!("unsupported schema_version: {}", receipt.schema_version);
     }
@@ -279,24 +546,37 @@ fn verify(receipt: &Receipt, quiet: bool) -> Result<()> {
     // 2) Methodology version match
     let cli_version = methodology_version();
     if receipt.methodology_version != cli_version {
+        if json {
+            emit_json_and_exit(
+                "version_mismatch",
+                3,
+                Some(receipt),
+                None,
+                None,
+                Some(&format!(
+                    "receipt methodology v{} != this build's embedded methodology v{}",
+                    receipt.methodology_version, cli_version
+                )),
+            );
+        }
         eprintln!(
-            "VERSION_MISMATCH: this receipt was produced by methodology v{}, but this \
+            "{}: this receipt was produced by methodology v{}, but this \
              pegana-replay build embeds methodology v{}. Verification is exact-match by design.",
-            receipt.methodology_version, cli_version
+            paint("VERSION_MISMATCH", "31"),
+            receipt.methodology_version,
+            cli_version
         );
         // Install via crates.io (the canonical, always-available channel) rather
         // than a bespoke install.sh mirror: `cargo install pegana-replay` needs no
-        // custom DNS and the latest release always embeds the current methodology.
-        // The CLI is versioned independently of the methodology it embeds (e.g.
-        // pegana-replay 0.5.0 embeds methodology 0.7.0), so for an OLDER receipt
-        // the user picks the matching historical build from the crates.io version
-        // list rather than a methodology-numbered tag.
+        // custom DNS. The CLI is versioned independently of the methodology it
+        // embeds (e.g. pegana-replay 0.4.2 embeds methodology 0.5.0), so an older
+        // receipt needs one SPECIFIC historical build — version_mismatch_hint maps
+        // it exactly instead of pointing at a list the user has to decode. Most
+        // published receipts are on an older methodology than the current one, so
+        // this hint is the common path, not the edge case.
         eprintln!(
-            "Install the pegana-replay build that embeds methodology v{ver}:\n  \
-             cargo install pegana-replay          # latest release — verifies current-methodology receipts\n  \
-             # older receipt? pick the build embedding methodology v{ver} at \
-             https://crates.io/crates/pegana-replay/versions",
-            ver = receipt.methodology_version
+            "{}",
+            version_mismatch_hint(&receipt.methodology_version, cli_version)
         );
         std::process::exit(3);
     }
@@ -317,7 +597,17 @@ fn verify(receipt: &Receipt, quiet: bool) -> Result<()> {
     let recomputed_hex = hex_sha256(recomputed_hash);
 
     if recomputed_hex != receipt.expected_receipt_sha256 {
-        eprintln!("FAIL  receipt sha256 mismatch");
+        if json {
+            emit_json_and_exit(
+                "fail",
+                1,
+                Some(receipt),
+                None,
+                None,
+                Some("receipt sha256 mismatch"),
+            );
+        }
+        eprintln!("{}  receipt sha256 mismatch", paint("FAIL", "31"));
         eprintln!("  expected: {}", receipt.expected_receipt_sha256);
         eprintln!("  computed: {}", recomputed_hex);
         std::process::exit(1);
@@ -338,7 +628,17 @@ fn verify(receipt: &Receipt, quiet: bool) -> Result<()> {
             || r.discount_smooth != computed.discount_smooth
             || r.final_state != computed.final_state
         {
-            eprintln!("FAIL  re-derivation mismatch");
+            if json {
+                emit_json_and_exit(
+                    "fail",
+                    1,
+                    Some(receipt),
+                    None,
+                    None,
+                    Some("re-derivation mismatch"),
+                );
+            }
+            eprintln!("{}  re-derivation mismatch", paint("FAIL", "31"));
             eprintln!(
                 "  expected: discount_raw={} discount_smooth={} final_state={:?}",
                 computed.discount_raw, computed.discount_smooth, computed.final_state
@@ -354,12 +654,17 @@ fn verify(receipt: &Receipt, quiet: bool) -> Result<()> {
         " (tamper-evident only; v1 not re-derived)"
     };
 
-    if !quiet {
+    if !quiet && !json {
         let inputs = &receipt.inputs_frozen;
         let computed = &receipt.expected_computed;
         println!(
-            "PASS  {}  {:?} -> {:?}  @ {}{}",
-            inputs.asset, inputs.previous_state, computed.final_state, inputs.now, rederived_note
+            "{}  {}  {:?} -> {:?}  @ {}{}",
+            paint("PASS", "32"),
+            inputs.asset,
+            inputs.previous_state,
+            computed.final_state,
+            inputs.now,
+            rederived_note
         );
         println!(
             "      methodology v{}, assets_toml sha256:{}",
@@ -381,7 +686,25 @@ async fn verify_onchain(
     alert_id: Uuid,
     receipt: &Receipt,
     quiet: bool,
-) -> Result<()> {
+    json: bool,
+) -> Result<Option<String>> {
+    // In --json mode every on-chain MISMATCH (exit 4) emits the verdict + exits
+    // right here (skipping the human detail below); in human mode this returns
+    // and the caller prints its rich per-case explanation + Solscan link,
+    // unchanged. The exit CODE is identical either way.
+    let onchain_fail = |reason: &str| {
+        if json {
+            emit_json_and_exit(
+                "onchain_mismatch",
+                4,
+                Some(receipt),
+                Some(&alert_id),
+                None,
+                Some(reason),
+            );
+        }
+    };
+
     // 1) Fetch tx_sig from API.
     let url = format!(
         "{}/v1/audit/{}/onchain",
@@ -397,13 +720,13 @@ async fn verify_onchain(
         let status = body_404["commit_status"].as_str().unwrap_or("unknown");
         let final_state = receipt.expected_computed.final_state;
         if onchain_skip_is_ok(status, final_state) {
-            if !quiet {
+            if !quiet && !json {
                 eprintln!(
                     "Note: no on-chain anchor for this alert (commit_status: {status}) — \
                      expected; {final_state:?} transitions are never anchored on-chain.",
                 );
             }
-            return Ok(());
+            return Ok(None);
         }
         // `not_applicable` on a state the anchor policy DOES cover
         // (Depeg / Critical / BlackSwan): the engine's on-chain commit was
@@ -433,7 +756,8 @@ async fn verify_onchain(
                  commit window — ADR-0004)"
             );
         }
-        eprintln!("ANCHOR NOT VERIFIED (status: {status})");
+        onchain_fail(&format!("on-chain anchor not verified (status: {status})"));
+        eprintln!("{} (status: {status})", paint("ANCHOR NOT VERIFIED", "31"));
         std::process::exit(4);
     }
     if !resp.status().is_success() {
@@ -507,9 +831,13 @@ async fn verify_onchain(
                 // Non-Parsed message (Raw/Legacy): cannot determine fee-payer identity.
                 // Fail safe: treating an unverifiable signer as a mismatch is
                 // the only trustless interpretation.
+                onchain_fail(
+                    "on-chain tx returned a non-Parsed message encoding — cannot verify signer",
+                );
                 eprintln!(
-                    "FAIL  on-chain tx {} returned a non-Parsed message encoding — \
+                    "{}  on-chain tx {} returned a non-Parsed message encoding — \
                      cannot verify the commit signer (fail-safe exit).",
+                    paint("FAIL", "31"),
                     tx_sig_str
                 );
                 eprintln!("Solscan: https://solscan.io/tx/{}", tx_sig_str);
@@ -518,9 +846,11 @@ async fn verify_onchain(
         },
         _ => {
             // Non-Json encoding (Binary/LegacyBinary/Accounts): cannot determine signer.
+            onchain_fail("on-chain tx returned a non-Json encoding — cannot verify signer");
             eprintln!(
-                "FAIL  on-chain tx {} returned a non-Json encoding — \
+                "{}  on-chain tx {} returned a non-Json encoding — \
                  cannot verify the commit signer (fail-safe exit).",
+                paint("FAIL", "31"),
                 tx_sig_str
             );
             eprintln!("Solscan: https://solscan.io/tx/{}", tx_sig_str);
@@ -531,8 +861,10 @@ async fn verify_onchain(
     // Verify the fee-payer (account_keys[0]) is in the PEGANA_COMMIT_SIGNERS allowlist.
     let fee_payer_pubkey = match parsed.account_keys.first() {
         None => {
+            onchain_fail("on-chain tx has no account_keys — cannot verify signer");
             eprintln!(
-                "FAIL  on-chain tx {} has no account_keys — cannot verify signer",
+                "{}  on-chain tx {} has no account_keys — cannot verify signer",
+                paint("FAIL", "31"),
                 tx_sig_str
             );
             eprintln!("Solscan: https://solscan.io/tx/{}", tx_sig_str);
@@ -540,8 +872,10 @@ async fn verify_onchain(
         }
         Some(fee_payer) => {
             if !onchain_signer_ok(&fee_payer.pubkey, fee_payer.signer, PEGANA_COMMIT_SIGNERS) {
+                onchain_fail("on-chain tx was NOT signed by an accepted Pegana commit wallet");
                 eprintln!(
-                    "FAIL  on-chain tx {} was NOT signed by an accepted Pegana commit wallet.",
+                    "{}  on-chain tx {} was NOT signed by an accepted Pegana commit wallet.",
+                    paint("FAIL", "31"),
                     tx_sig_str
                 );
                 eprintln!("  observed signer : {}", fee_payer.pubkey);
@@ -572,8 +906,10 @@ async fn verify_onchain(
     }
 
     if memo_payloads.is_empty() {
+        onchain_fail("on-chain tx has no SPL Memo instruction — cannot verify receipt sha256");
         eprintln!(
-            "FAIL  on-chain tx {} has no SPL Memo instruction — cannot verify receipt sha256",
+            "{}  on-chain tx {} has no SPL Memo instruction — cannot verify receipt sha256",
+            paint("FAIL", "31"),
             tx_sig_str
         );
         std::process::exit(4);
@@ -592,8 +928,10 @@ async fn verify_onchain(
     });
 
     if !matched {
+        onchain_fail("on-chain memo does NOT match receipt sha256");
         eprintln!(
-            "FAIL  on-chain memo at {} does NOT match receipt sha256:",
+            "{}  on-chain memo at {} does NOT match receipt sha256:",
+            paint("FAIL", "31"),
             tx_sig_str
         );
         eprintln!("  expected sha256 in memo: {}", expected_sha);
@@ -605,7 +943,7 @@ async fn verify_onchain(
         std::process::exit(4);
     }
 
-    if !quiet {
+    if !quiet && !json {
         println!(
             "      on-chain memo verified: tx {} carries pegana-v1|...|{}",
             tx_sig_str,
@@ -614,13 +952,15 @@ async fn verify_onchain(
         println!("      on-chain signer confirmed: {}", fee_payer_pubkey);
         println!("      explorer: https://solscan.io/tx/{}", tx_sig_str);
     }
-    Ok(())
+    Ok(Some(tx_sig_str.to_string()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        is_onchain_pending, onchain_signer_ok, onchain_skip_is_ok, state_expects_anchor, verify,
+        cli_build_for_methodology, is_onchain_pending, long_version_string, onchain_signer_ok,
+        onchain_skip_is_ok, parse_semver, state_expects_anchor, verify, version_mismatch_hint,
+        CLI_BUILD_FOR_METHODOLOGY,
     };
     use chrono::DateTime;
     use pegana_common_verify::{AssetClass, PegState};
@@ -707,21 +1047,21 @@ mod tests {
         let receipt = make_receipt("v2", stub_inputs(PegState::Pegged), stub_computed());
         // verify() calls std::process::exit on failure, so this returning Ok is
         // proof the path succeeded.
-        assert!(verify(&receipt, true).is_ok());
+        assert!(verify(&receipt, true, false).is_ok());
     }
 
     /// A v1 receipt passes verify (re-hash only, no re-derive).
     #[test]
     fn v1_receipt_verify_pass_no_rederive() {
         let receipt = make_receipt("v1", stub_inputs(PegState::Pegged), stub_computed());
-        assert!(verify(&receipt, true).is_ok());
+        assert!(verify(&receipt, true, false).is_ok());
     }
 
     /// An unknown schema_version returns an error (not process::exit).
     #[test]
     fn unknown_schema_version_returns_err() {
         let receipt = make_receipt("v3", stub_inputs(PegState::Pegged), stub_computed());
-        let result = verify(&receipt, true);
+        let result = verify(&receipt, true, false);
         assert!(result.is_err(), "unknown schema_version must error");
         let msg = format!("{:?}", result.unwrap_err());
         assert!(
@@ -970,5 +1310,121 @@ mod tests {
                 "status {s} must not read as pending"
             );
         }
+    }
+
+    // ── --version reports CLI + embedded methodology (exit-3 UX) ─────────────
+
+    #[test]
+    fn long_version_reports_cli_and_methodology() {
+        let v = long_version_string();
+        // The CLI crate version (what `-V` shows).
+        assert!(
+            v.contains(env!("CARGO_PKG_VERSION")),
+            "long version must include the CLI version: {v}"
+        );
+        // The embedded methodology version — the identity verify() matches on.
+        assert!(
+            v.contains(methodology_version()),
+            "long version must include the methodology version: {v}"
+        );
+        assert!(v.contains("methodology"), "must name methodology: {v}");
+        assert!(
+            v.contains("pinned commit signer"),
+            "must report pinned signer count: {v}"
+        );
+    }
+
+    #[test]
+    fn version_map_never_claims_a_build_for_the_current_methodology() {
+        // The current methodology is served by the LATEST release, so pinning it
+        // would send users to a stale build. If a methodology bump ever lands
+        // without moving this table, this test catches it.
+        assert!(
+            cli_build_for_methodology(methodology_version()).is_none(),
+            "the embedded methodology v{} must not be in the historical pin table",
+            methodology_version()
+        );
+    }
+
+    #[test]
+    fn hint_gives_an_exact_pin_for_every_known_historical_receipt() {
+        for (methodology, cli) in CLI_BUILD_FOR_METHODOLOGY {
+            let hint = version_mismatch_hint(methodology, methodology_version());
+            let expected = format!("cargo install pegana-replay@{cli} --locked");
+            assert!(
+                hint.contains(&expected),
+                "methodology v{methodology} must map to `{expected}`, got: {hint}"
+            );
+            // A pin must never degrade into "go browse the version list".
+            assert!(
+                !hint.contains("versions"),
+                "hint for v{methodology} should be an exact command: {hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn hint_tells_a_stale_cli_to_update() {
+        // Receipt newer than the build => the user is behind, not the receipt.
+        let hint = version_mismatch_hint("9.9.9", methodology_version());
+        assert!(
+            hint.contains("NEWER"),
+            "must say the receipt is newer: {hint}"
+        );
+        assert!(
+            hint.contains("cargo install pegana-replay --locked")
+                && !hint.contains("pegana-replay@"),
+            "must point at the latest release, unpinned: {hint}"
+        );
+    }
+
+    #[test]
+    fn every_install_command_is_locked() {
+        // A bare `cargo install pegana-replay@X` re-resolves the caret dependency
+        // on the methodology crate to a newer patch, reintroducing the very
+        // VERSION_MISMATCH this hint exists to resolve (proven against crates.io:
+        // 0.4.3 resolves methodology to 0.6.1, not the 0.6.0 its lockfile pins).
+        // Any emitted install command that loses --locked silently breaks the
+        // verify-it-yourself path.
+        let samples = ["0.4.0", "0.5.0", "0.6.0", "0.6.1", "9.9.9"];
+        for receipt_ver in samples {
+            let hint = version_mismatch_hint(receipt_ver, methodology_version());
+            for line in hint.lines() {
+                let cmd = line.trim();
+                if cmd.starts_with("cargo install") {
+                    assert!(
+                        cmd.contains("--locked"),
+                        "install command for v{receipt_ver} must be --locked: {cmd}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn hint_is_honest_when_no_published_build_can_verify() {
+        // methodology 0.3.0 predates the 2026-07-01 first publish: no artifact
+        // exists. Claiming otherwise would send the user on a dead hunt.
+        let hint = version_mismatch_hint("0.3.0", methodology_version());
+        assert!(
+            hint.contains("No published build"),
+            "must say plainly that nothing can verify it: {hint}"
+        );
+        assert!(
+            !hint.contains("cargo install"),
+            "must not suggest an install that cannot work: {hint}"
+        );
+    }
+
+    #[test]
+    fn parse_semver_accepts_triples_and_rejects_everything_else() {
+        assert_eq!(parse_semver("0.7.0"), Some((0, 7, 0)));
+        assert_eq!(parse_semver("1.10.2"), Some((1, 10, 2)));
+        assert_eq!(parse_semver("0.7"), None, "two components");
+        assert_eq!(parse_semver("0.7.0.1"), None, "four components");
+        assert_eq!(parse_semver("0.7.x"), None, "non-numeric");
+        assert_eq!(parse_semver(""), None, "empty");
+        // Ordering is numeric, not lexical — "0.10.0" > "0.9.0".
+        assert!(parse_semver("0.10.0") > parse_semver("0.9.0"));
     }
 }
