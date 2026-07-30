@@ -7,9 +7,19 @@ seriously.
 
 ## Reporting a vulnerability
 
-Report privately via Telegram to [@PeganaWatchBot](https://t.me/PeganaWatchBot)
-before any public disclosure — same channel documented in `CONTRIBUTING.md`.
-Please do not open a public GitHub issue for a suspected vulnerability.
+**Preferred — GitHub private vulnerability reporting:**
+[open a draft advisory](https://github.com/PeganaHQ/ReplayCLI/security/advisories/new).
+It is private until we publish it, gives you an audit trail, and is the route
+to a CVE if one is warranted.
+
+**Alternative — Telegram:** [@PeganaWatchBot](https://t.me/PeganaWatchBot).
+
+Either way, please report privately before any public disclosure. Do not open a
+public GitHub issue for a suspected vulnerability.
+
+We aim to acknowledge within 72 hours. Pegana is run by a solo maintainer — if
+you have not heard back in a week, ping the other channel before assuming the
+report was ignored.
 
 Include, if possible:
 - The affected crate/file and a minimal reproduction (a receipt, alert ID, or

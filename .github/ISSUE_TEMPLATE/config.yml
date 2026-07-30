@@ -1,0 +1,30 @@
+# This repo is a generated, force-pushed mirror — the issue tracker here is
+# not the place work gets tracked. Blank issues are disabled and every route
+# points at a channel a human actually reads.
+#
+# The security link is deliberately first: a vulnerability in the verifier is
+# the one report that must never sit unread in a tracker nobody watches.
+#
+# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability (private)
+    url: https://github.com/PeganaHQ/ReplayCLI/security/advisories/new
+    about: >-
+      A bug that could let a tampered receipt verify as clean. Please use
+      private reporting — never a public issue — before disclosure.
+
+  - name: Bug report, question, or feedback
+    url: https://t.me/PeganaWatchBot
+    about: Routes to a human. Fastest channel for anything non-security.
+
+  - name: Methodology change (requires an ADR)
+    url: https://t.me/PeganaWatchBot
+    about: >-
+      methodology_version is embedded in every receipt — changing the math
+      silently would break replay for receipts produced under the old rules.
+      Start the discussion first; see CONTRIBUTING.md.
+
+  - name: Verify an alert yourself
+    url: https://www.pegana.xyz/audit
+    about: The live audit ledger. Every published receipt, replayable.

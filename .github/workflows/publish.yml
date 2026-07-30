@@ -1,0 +1,121 @@
+# Publish the three mirrored crates to crates.io via TRUSTED PUBLISHING.
+#
+# WHY: publishing used to be a manual `cargo publish` from a laptop holding a
+# long-lived CARGO_REGISTRY_TOKEN. That token is the single most dangerous
+# credential in this project — whoever holds it can ship a malicious
+# `pegana-replay` that reports PASS on tampered receipts, and users would
+# install it with `cargo install` without ever touching this repo.
+#
+# Trusted Publishing (RFC 3691) removes the credential entirely: GitHub issues
+# a short-lived OIDC identity token proving this workflow, in this repo, is
+# running; crates.io exchanges it for a publish token valid for minutes. There
+# is no secret to leak, rotate, or forget. The auth action's post-step revokes
+# the token when the job ends.
+#
+# ── ONE-TIME SETUP ON CRATES.IO (cannot be automated) ───────────────────────
+# For EACH of the three crates, go to
+#   crates.io/crates/<name>/settings  →  "Trusted Publishing"  →  Add
+# and enter:
+#   Repository owner : PeganaHQ
+#   Repository name  : ReplayCLI
+#   Workflow filename: publish.yml
+#   Environment      : crates-io          (must match `environment:` below)
+# Then enable "Require Trusted Publishing" on each crate so API-token
+# publishing is refused from then on. That last step is what actually closes
+# the hole — until it is set, the old token still works.
+#
+# The `environment:` is not decoration: it lets you require manual approval
+# before any publish runs, so a compromised tag alone cannot ship a crate.
+# Configure reviewers at Settings → Environments → crates-io.
+#
+# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+# Editing it here is pointless; the next sync overwrites it.
+name: Publish to crates.io
+
+on:
+  push:
+    tags:
+      - "v*"
+      - "methodology-v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run cargo publish --dry-run only"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+    permissions:
+      contents: read
+      id-token: write   # REQUIRED — the OIDC token exchanged for a crates.io token
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb2c1c2f0470a653927b17 # master @ 2025-11-06
+        with:
+          toolchain: "1.90"
+
+      - name: Authenticate to crates.io (OIDC)
+        id: auth
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      # Dependency order is load-bearing: methodology depends on common-verify,
+      # and pegana-replay depends on both. Publishing out of order fails because
+      # the registry cannot resolve the dependency that does not exist yet.
+      #
+      # Each crate is skipped if that exact version is already on crates.io, so
+      # re-running after a partial failure is safe and a `methodology-v*` tag
+      # that does not bump the CLI does not error out.
+      - name: Publish crates in dependency order
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+
+          # crates.io returns 200 for an existing version, 404 otherwise.
+          # A User-Agent is mandatory — the API rejects anonymous clients
+          # under its data-access policy.
+          published() {  # $1 = crate name, $2 = version
+            curl -sS --fail -o /dev/null \
+              -H 'User-Agent: pegana-release (rafael@pegana.xyz)' \
+              "https://crates.io/api/v1/crates/$1/$2"
+          }
+
+          for dir in crates/common-verify crates/methodology crates/pegana-replay-cli; do
+            name="$(cargo metadata --no-deps --format-version 1 --manifest-path "$dir/Cargo.toml" \
+                    | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["name"])')"
+            vers="$(cargo metadata --no-deps --format-version 1 --manifest-path "$dir/Cargo.toml" \
+                    | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')"
+
+            if [[ "${DRY_RUN:-false}" == "true" ]]; then
+              echo "::group::dry-run $name $vers"
+              cargo publish --locked --manifest-path "$dir/Cargo.toml" --dry-run
+              echo "::endgroup::"
+              continue
+            fi
+
+            if published "$name" "$vers"; then
+              echo "→ $name $vers already on crates.io, skipping"
+              continue
+            fi
+
+            echo "::group::publish $name $vers"
+            # --locked: publish the exact dependency graph CI tested, not a
+            # freshly re-resolved one.
+            cargo publish --locked --manifest-path "$dir/Cargo.toml"
+            echo "::endgroup::"
+          done

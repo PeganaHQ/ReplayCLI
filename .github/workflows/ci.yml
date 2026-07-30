@@ -1,0 +1,68 @@
+# Public CI for the mirrored tree.
+#
+# WHY THIS EXISTS AT ALL, on a repo nobody can send PRs to:
+# the mirror is assembled by subtree-split + read-tree in the private repo,
+# so "it builds in the private monorepo" does NOT prove "the published tree
+# builds standalone". This workflow is the only thing that proves the code a
+# third party actually downloads compiles, passes its tests, and matches its
+# committed lockfile. That proof is the product here.
+#
+# It also catches the mirror-assembly failure mode directly: if a sync ever
+# ships a tree with a dangling path dependency or a stale Cargo.lock, this
+# goes red on the sync commit itself.
+#
+# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+# Editing it here is pointless; the next sync overwrites it.
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Deliberately NOT setting a global `RUSTFLAGS: -D warnings`: RUSTFLAGS
+  # applies to dependencies too, so one warning in a transitive crate we do
+  # not control turns CI red for reasons no one here can fix. Denying warnings
+  # belongs on the clippy invocation, where it only covers our own code.
+
+jobs:
+  build:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb2c1c2f0470a653927b17 # master @ 2025-11-06
+        with:
+          toolchain: "1.90"
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace --all-targets
+
+      # --locked is the point: proves the committed Cargo.lock actually
+      # resolves the tree we published, so `cargo install --locked` and the
+      # attested release binaries are built from the same dependency graph.
+      - name: verify lockfile is current
+        run: cargo build --workspace --locked

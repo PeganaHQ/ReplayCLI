@@ -1,129 +1,187 @@
-# pegana-replay
+<h1 align="center">ReplayCLI</h1>
 
-Open math + CLI behind every Pegana alert.
+<p align="center">
+  <strong>Don't trust the peg alert. Re-derive it.</strong><br>
+  The open math and offline verifier behind every <a href="https://www.pegana.xyz">Pegana</a> peg-risk receipt.
+</p>
 
-[pegana.xyz](https://www.pegana.xyz) is a peg-risk oracle for Solana. It watches
-~27 LSTs, stablecoins, yield-bearing wrappers, CDPs, and synthetic-leverage
-tokens, and publishes a state transition the moment an asset moves out of
-PEGGED. Every alert ships with a **content-addressed receipt** — this repo is
-how anyone outside Pegana can verify one. Verification is two layers, and the
-CLI runs both by default: (1) recompute the receipt's canonical SHA-256 and
-compare it to the published hash — proves the receipt's fields are internally
-self-consistent; (2) confirm that exact hash is anchored on Solana in an SPL
-Memo signed by one of Pegana's pinned ops wallets — proves the receipt wasn't
-swapped for a different, equally self-consistent one after the fact. Layer 2
-is what makes the tamper-evidence claim hold; skip it with `--offline` and
-you're trusting layer 1 alone.
+<p align="center">
+  <a href="https://crates.io/crates/pegana-replay"><img alt="crates.io" src="https://img.shields.io/crates/v/pegana-replay.svg?logo=rust"></a>
+  <a href="https://github.com/PeganaHQ/ReplayCLI/actions/workflows/release.yml"><img alt="Release" src="https://github.com/PeganaHQ/ReplayCLI/actions/workflows/release.yml/badge.svg"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/PeganaHQ/ReplayCLI"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/PeganaHQ/ReplayCLI/badge"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.90+-orange.svg">
+</p>
 
-## Verify a Pegana alert in 60 seconds
+---
 
-**Option A — install the CLI (crates.io):**
+[pegana.xyz](https://www.pegana.xyz) is a peg-risk oracle for Solana. It watches ~70 stablecoins,
+LSTs, yield-bearing wrappers, CDPs and synthetic-leverage tokens (live count:
+[`/v1/stats`](https://api.pegana.xyz/v1/stats)) and publishes a state transition the moment an
+asset leaves `PEGGED`.
+
+Every alert ships a **content-addressed receipt**. This repo is how anyone outside Pegana proves
+that receipt is real — without asking Pegana's servers to vouch for themselves.
+
+## Why this repo exists
+
+An oracle that says "trust me" is not an oracle. So Pegana publishes the *same* pure functions its
+production engine runs, and a CLI that replays any receipt against them offline.
+
+Verification is two independent layers, and the CLI runs **both by default**:
+
+| Layer | What it proves | Defeats |
+|---|---|---|
+| **1. Canonical re-hash** | The receipt's fields are internally self-consistent — recompute its SHA-256 and compare to the published hash. | Silent edits to a receipt's numbers. |
+| **2. On-chain anchor** | That exact hash is anchored on Solana in an SPL Memo signed by a **pinned** Pegana ops wallet. | Swapping in a *different*, equally self-consistent receipt after the fact. |
+
+`--offline` skips layer 2. That's a real reduction in guarantee, not a shortcut — see
+[What PASS actually means](#what-pass-actually-means).
+
+## Quick start
+
+**Install** — pre-built, Sigstore-attested binary (linux-x86_64, darwin-aarch64):
+
 ```sh
-cargo install pegana-replay
-pegana-replay --alert-id <UUID>     # an alert id from pegana.xyz or the API
-# → PASS  receipt_sha256 matches (on-chain anchor + signer verified when present)
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://releases.pegana.xyz/pegana-replay-installer.sh | sh
 ```
-By default this re-derives the receipt hash and, when the receipt carries an
-on-chain anchor (severe transitions), also verifies that anchor + its signer
-(RPC required). A severe receipt with no anchor reports ONCHAIN_INCOMPLETE, not
-a false PASS. For a hash-only check — CI, air-gapped hosts, or you just want it
-fast — add
-`--offline`, or verify a saved bundle entirely offline:
-`pegana-replay --bundle <path-to-replay-bundle.json>`. For CI or scripting, add
-`--json` for a single machine-readable verdict line on stdout (`status` +
-`exit_code` + the receipt's frozen `asset` / `final_state` /
-`methodology_version` / `receipt_sha256`); the exit code is unchanged. An
-interactive run also colors PASS green / FAIL red (honors `NO_COLOR` and stays
-plain when piped).
 
-**Option B — no install, verify in your browser:**
-Open the audit page for any alert — `https://www.pegana.xyz/audit/<alert-id>` — where the in-browser
-verifier (`ReceiptVerifier`) recomputes the canonical receipt hash in pure JS (byte-identical to the
-CLI), trusting nothing from our servers.
+<details>
+<summary>Other install methods</summary>
 
-**What PASS means:** with the default on-chain check, PASS means the recomputed `receipt_sha256`
-equals the published one AND that hash is anchored on-chain under a pinned Pegana signer — together,
-the verdict and its inputs were not altered after the fact. With `--offline` (or `--bundle`, which is
-always offline), PASS means only the hash check passed: the receipt is internally self-consistent, but
-an attacker controlling the API could in principle have swapped in a different self-consistent receipt
-— the on-chain check is what rules that out. For schema-v2 receipts the CLI also re-derives the verdict
-from the frozen inputs (not just the hash).
+```sh
+# From crates.io (any platform with a Rust 1.90+ toolchain)
+cargo install pegana-replay --locked
+
+# From source — Intel Mac and Windows build this way
+cargo install --git https://github.com/PeganaHQ/ReplayCLI pegana-replay --locked
+```
+
+`--locked` matters: without it Cargo re-resolves the dependency graph and you are no longer
+building the tree this repo's `Cargo.lock` pins.
+</details>
+
+**Verify an alert** — grab any alert id from [pegana.xyz](https://www.pegana.xyz) or the API:
+
+```sh
+pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789
+# → PASS  receipt_sha256 matches (on-chain anchor + signer verified)
+```
+
+```sh
+# Hash-only, no RPC — CI and air-gapped hosts
+pegana-replay --alert-id <UUID> --offline
+
+# A saved bundle, fully offline
+pegana-replay --bundle ./replay-bundle.json
+
+# One machine-readable line on stdout; exit code unchanged
+pegana-replay --alert-id <UUID> --json
+# {"status":"PASS","exit_code":0,"asset":"jitoSOL","previous_state":"Pegged",
+#  "final_state":"Pegged","methodology_version":"0.7.0","receipt_sha256":"…","alert_id":"…"}
+```
+
+**No install?** Open `https://www.pegana.xyz/audit/<alert-id>` — the in-browser `ReceiptVerifier`
+recomputes the canonical hash in pure JS, byte-identical to this CLI.
+
+## Exit codes
+
+Stable contract — safe to branch on in CI.
+
+| Code | Status | Meaning |
+|:--:|---|---|
+| `0` | `PASS` | Hash matches. With `--alert-id` and no `--offline`, the on-chain anchor + pinned signer matched too. |
+| `1` | `FAIL` | Receipt SHA-256 mismatch, or schema-v2 re-derivation mismatch. **Tamper or corruption.** |
+| `2` | `ERROR` | Network failure, malformed bundle, unknown alert, or bad CLI usage. |
+| `3` | `VERSION_MISMATCH` | The receipt's `methodology_version` ≠ this binary's embedded version. Install the matching build. |
+| `4` | `ONCHAIN_MISMATCH` | The on-chain check ran and **failed** — wrong/absent signer, no memo, memo content mismatch, or anchoring permanently failed. |
+| `5` | `ONCHAIN_INCOMPLETE` | The on-chain check could not be completed — RPC unreachable, anchor still inside its 24h commit window, or commit was disabled for the emitting deployment. **Absent, not tampered.** |
+
+Note `4` vs `5`: a severe transition with no anchor reports `ONCHAIN_INCOMPLETE`, never a false `PASS`.
+
+## What PASS actually means
+
+- **Default (`--alert-id`, no `--offline`)** — the recomputed `receipt_sha256` equals the published
+  one **and** that hash is anchored on-chain under a pinned Pegana signer. The verdict and its
+  inputs were not altered after the fact.
+- **`--offline` / `--bundle`** — only layer 1 passed. The receipt is internally self-consistent, but
+  an attacker controlling the API could in principle have served a *different* self-consistent
+  receipt. Layer 2 is what rules that out.
+- **Schema-v2 receipts** — the CLI also re-derives the verdict from the receipt's **own frozen
+  inputs**. Never against fresh oracle data; replay is historical, not live.
 
 ## What's in this repo
 
 | Path | What it is |
 |---|---|
-| `crates/methodology/` | Pure functions: spread, EWMA, hysteresis, transition. The exact code the engine runs in production. |
-| `crates/pegana-replay-cli/` | The CLI binary: fetches a receipt, re-hashes it against the published hash, re-derives the verdict from the receipt's OWN frozen inputs (schema-v2 only — never against fresh oracle data), and by default cross-checks the on-chain SPL Memo anchor. Reports PASS / FAIL / ERROR / VERSION_MISMATCH / ONCHAIN_MISMATCH / ONCHAIN_INCOMPLETE. |
-| `crates/common-verify/` | Config types + the AlertEvidence schema returned by `/v1/audit/:id`. |
-| `assets.toml` | Canonical asset list. Symbol, mint, class, peg target, threshold bands, intrinsic + market strategies. Hashed into every receipt. |
-| `docs/adr/` | Architecture Decision Records — every load-bearing methodology choice is dated and rationalised here. |
-| `.github/workflows/release.yml` | `cargo-dist` pipeline that publishes signed binaries to GitHub Releases on every `v*` tag, with Sigstore attestations via GitHub-issued OIDC. |
+| `crates/methodology/` | Pure, zero-I/O functions: discount, EWMA, hysteresis, thresholds, transitions, receipt hashing. **The exact code the production engine runs.** |
+| `crates/pegana-replay-cli/` | The `pegana-replay` binary. Fetches a receipt, re-hashes it, re-derives the verdict from frozen inputs, cross-checks the on-chain SPL Memo anchor. |
+| `crates/common-verify/` | Config types + the `AlertEvidence` schema returned by `/v1/audit/:id`. |
+| `assets.toml` | Canonical asset registry — symbol, mint, class, peg target, threshold bands, intrinsic + market strategies. Hashed into every receipt. |
+| `METHODOLOGY.md` | Long-form prose companion to `crates/methodology`. The code is authoritative; this explains it. |
+| `.github/workflows/release.yml` | `cargo-dist` pipeline. Publishes attested binaries on every `v*` tag, signed via GitHub-issued OIDC (no key material). |
 
-## What's NOT in this repo
+**Not here:** the engine, dispatcher, indexer, API, MCP server, Telegram bot, on-chain commit
+pipeline and webhook signing live in a closed sibling repo. Closed for operational reasons — but
+**every decision they produce is reproducible from this repo** against the alert's receipt.
 
-The engine, dispatcher, indexer, API server, MCP server, Telegram bot,
-on-chain commit pipeline, and webhook signing primitives live in a closed
-sibling repo (`lrafasouza/pegana`, private). Closed for operational reasons —
-**every decision they produce, however, is reproducible from this repo**
-against the alert's audit receipt URL.
+## Verifying the binary itself
 
-This repo is automatically mirrored from the private one by a path-filtered
-subtree-push action; do not file PRs against it directly (see CONTRIBUTING).
-
-## Verify a specific alert end-to-end
+Release binaries carry Sigstore build provenance issued by this repo's CI:
 
 ```sh
-# 1. Install the verifier (no Rust toolchain needed — curl|sh ships a
-#    pre-built, Sigstore-attested binary for linux-x86_64 and
-#    darwin-aarch64. Intel Mac and Windows build from source via
-#    `cargo install --git`.)
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://releases.pegana.xyz/pegana-replay-installer.sh | sh
-
-# 2. Fetch the bundle and verify BOTH layers (default as of v0.5.0):
-#    re-hash the receipt's frozen inputs + recorded verdict, THEN confirm
-#    that hash is anchored on-chain in an SPL Memo signed by a pinned
-#    Pegana ops wallet. Needs a working Solana RPC (override --solana-rpc).
-#    Does NOT re-execute the methodology.
-pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789
-
-# 3. Hash-only, no RPC call (CI, air-gapped hosts):
-pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789 --offline
-
-# 3b. Machine-readable verdict for CI / scripting — one JSON line to stdout,
-#     exit code unchanged; combine with --offline for a no-RPC check:
-pegana-replay --alert-id 0190ab12-3456-7890-abcd-ef0123456789 --json
-# → {"status":"PASS","exit_code":0,"asset":"jitoSOL","previous_state":"Pegged",
-#    "final_state":"Pegged","methodology_version":"0.7.0","receipt_sha256":"…","alert_id":"…"}
-
-# 4. Verify the binary's provenance via the Sigstore attestation issued
-#    by this repo's CI (linux-x86_64 / darwin-aarch64 release binaries).
-gh attestation verify ~/.pegana/bin/pegana-replay \
-  --repo PeganaHQ/ReplayCLI
+gh attestation verify ~/.pegana/bin/pegana-replay --repo PeganaHQ/ReplayCLI
 ```
+
+> **Binaries tagged `v0.4.4` and earlier** were built before this repo moved to the `PeganaHQ` org
+> and are attested to the old repository identity. Verify those with
+> `--repo lrafasouza/pegana-replay`, or upgrade — `v0.5.0+` attests to `PeganaHQ/ReplayCLI`.
 
 ## Versioning
 
-- The CLI **embeds exactly one methodology version**, and its release tag is
-  **decoupled** from it: e.g. CLI `v0.4.1` embeds methodology `0.4.0` (the CLI
-  can ship fixes without a methodology bump). What matters for replay is the
-  **embedded methodology version**, not the CLI tag. A receipt carries the
-  `methodology_version` it was produced under, so anyone reading an old receipt
-  installs the CLI build that embeds *that* methodology and replays against it
-  *as it was at the time*, not as it is today. (The CLI enforces this: a receipt
-  whose `methodology_version` differs from the binary's **embedded** methodology
-  version exits `3` VERSION_MISMATCH with a hint to install the matching build.)
-- Each `v*` tag builds two Sigstore-attested targets — `x86_64-unknown-linux-gnu`
-  and `aarch64-apple-darwin`. Intel Mac and Windows build from source.
+The CLI **embeds exactly one methodology version**, and its release tag is **decoupled** from it —
+CLI `v0.4.1` embedded methodology `0.4.0`, because the CLI can ship fixes without a methodology bump.
+
+What matters for replay is the **embedded methodology version**, not the CLI tag. A receipt carries
+the `methodology_version` it was produced under; to read an old receipt, install the CLI build that
+embeds *that* methodology and replay against it **as it was at the time**. The CLI enforces this — a
+mismatch exits `3` with a hint, rather than silently replaying under today's rules.
+
+Each `v*` tag builds `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. Intel Mac and Windows
+build from source.
+
+## Security
+
+Reporting a vulnerability: see [SECURITY.md](SECURITY.md). Please report privately before public
+disclosure — a bug here could let a tampered receipt verify as clean.
+
+## Contributing
+
+This repo is a **one-way mirror**, automatically generated from a closed sibling repo and
+force-pushed. Direct commits are overwritten on the next sync. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to actually get a change landed, and
+[CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the ground rules.
+
+Disagreeing with a verdict is not a complaint — it's the intended use. Bring the alert id and
+the replay that disagrees.
+
+## Independent review
+
+[GeckoVision](https://www.npmjs.com/package/@geckovision/gecko) reviewed Pegana's public OpenAPI
+surface across three rounds with their own OpenAPI-to-agent tooling. Their linter graded the spec
+**A / 96**, and two of their findings shipped as fixes that are live in production today. Not an
+endorsement — an outside pair of eyes, credited because independent review is the whole point of
+this repo.
 
 ## License
 
-MIT. See `LICENSE`.
+MIT — see [LICENSE](LICENSE).
 
 ## Links
 
-- Site & live audit ledger: [www.pegana.xyz](https://www.pegana.xyz)
-- Self-hosted install mirror: [releases.pegana.xyz](https://releases.pegana.xyz)
-- Telegram for issues / feedback: [@PeganaWatchBot](https://t.me/PeganaWatchBot)
-- Twitter / X: [@PeganaHQ](https://x.com/PeganaHQ)
+- **Site & live audit ledger** — [www.pegana.xyz](https://www.pegana.xyz)
+- **Install mirror** — [releases.pegana.xyz](https://releases.pegana.xyz)
+- **API** — [api.pegana.xyz](https://api.pegana.xyz) · [OpenAPI](https://api.pegana.xyz/openapi.json)
+- **Telegram** — [@PeganaWatchBot](https://t.me/PeganaWatchBot)
+- **X** — [@PeganaHQ](https://x.com/PeganaHQ)

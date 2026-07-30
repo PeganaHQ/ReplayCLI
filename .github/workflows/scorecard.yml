@@ -1,0 +1,56 @@
+# OpenSSF Scorecard — automated security-posture scoring for this repo.
+#
+# This repo asks people to trust a binary that decides whether Pegana's own
+# alerts are honest. Publishing an independently-computed security score is
+# the same argument the CLI itself makes: don't take our word for it.
+#
+# publish_results: true is what makes the README badge resolve. Results are
+# published to the public OpenSSF API — intentional, this repo is public.
+#
+# NOTE: this file is mirrored from tools/pegana-replay-public/ in the private
+# repo. Editing it here is pointless; the next sync overwrites it.
+name: Scorecard
+
+on:
+  branch_protection_rule:
+  schedule:
+    - cron: '27 4 * * 2'   # weekly, Tuesday
+  push:
+    branches: [ main ]     # Scorecard only supports the default branch
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  analysis:
+    name: Scorecard analysis
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload SARIF to the code-scanning dashboard
+      id-token: write          # OIDC, required by publish_results
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run analysis
+        uses: ossf/scorecard-action@2d1146689b8cda280b9bc96326124645441f03bc # v2.4.4
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: SARIF file
+          path: results.sarif
+          retention-days: 5
+
+      - name: Upload to code-scanning
+        uses: github/codeql-action/upload-sarif@a2983b8bed1923f44751c5c43237f479442827b3 # v3
+        with:
+          sarif_file: results.sarif

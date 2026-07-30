@@ -12,9 +12,10 @@ talked to us first.
   GitHub issue tracker on this repo is not actively monitored yet.
 
 - **Methodology changes**: route through an ADR. Open the discussion on
-  Telegram, then propose a new file under `docs/adr/` with the rationale,
-  alternatives considered, and chosen design. Once accepted, the change lands
-  in the private repo and the next sync mirrors it here.
+  Telegram; the ADR itself is written in the private repo (ADRs are no longer
+  mirrored here) with the rationale, alternatives considered, and chosen
+  design. Once accepted, the code change lands there and the next sync mirrors
+  it into `crates/methodology/`.
 
 - **CLI ergonomics fixes** (replay-cli error messages, output formatting,
   exit-code handling): we'll happily review proposals on Telegram and land

@@ -62,11 +62,16 @@ jobs:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with: { submodules: recursive }
 
-      # Not SHA-pinned like the actions/* steps above: dtolnay/rust-toolchain
-      # resolves "1.90" against a branch of the same name that the action
-      # author moves as that Rust point-release gets patches — pinning to a
-      # SHA here would silently freeze us on a stale toolchain instead.
-      - uses: dtolnay/rust-toolchain@1.90
+      # SHA-pinned like every other step. The previous `@1.90` form relied on
+      # a moving branch, which is exactly the tj-actions/changed-files failure
+      # mode: whoever controls that ref controls this release build, and this
+      # job holds `id-token: write` (Sigstore signing). Pinning the ACTION does
+      # not freeze the TOOLCHAIN — `toolchain:` is resolved at run time, so we
+      # still get the latest 1.90.x patch release.
+      # Required by the repo's sha_pinning_required Actions policy.
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb2c1c2f0470a653927b17 # master @ 2025-11-06
+        with:
+          toolchain: "1.90"
 
       - name: Install dist
         shell: bash

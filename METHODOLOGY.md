@@ -1,4 +1,4 @@
-# Pegana methodology — v0.4.0
+# Pegana methodology — v0.7.0
 
 How peg-risk signals are produced, why this design over the obvious
 alternatives, and what every load-bearing piece of the math is doing.
@@ -133,17 +133,72 @@ risk signal is the *discount* (redemption stress, cf. stETH −7% in 2022,
 ezETH's depeg). `is_direction_sensitive` covers both classes (ADR-0021).
 Discount-side classification is unchanged.
 
-**NAV-premium sanity gate (v0.4.0, ADR-0025).** The premium→PEGGED
-carve-out is correct for real demand pressure but can silently mask a
-*broken intrinsic anchor* — e.g. sHYUSD: market ≈ +30% above a
-thin-Jupiter NAV print, yet PEGGED. If the premium exceeds
-`NAV_PREMIUM_SANITY_BPS = 1000` (10%) on a direction-sensitive class the
-engine concludes the NAV anchor is broken and forces the state to
-**UNKNOWN** instead. Legitimate premiums never approach this bound (the
-widest observed across all assets is INF ≈ 160 bps); the discount side
-and symmetric classes are untouched. Code:
-`crates/methodology/src/thresholds.rs` — `premium_sanity_violated` /
+### Honest-dark override gates
+
+Three independent guards can force a verdict to **UNKNOWN**. All three are
+*conservative-only*: they can push a verdict toward UNKNOWN, never away from
+it. Each stamps a distinct `state_reason` on the receipt, so a replay can tell
+which one fired.
+
+**1. NAV-premium sanity gate (v0.4.0, ADR-0025)** — `state_reason:
+premium_sanity`. The premium→PEGGED carve-out is correct for real demand
+pressure but can silently mask a *broken intrinsic anchor* — e.g. sHYUSD:
+market ≈ +30% above a thin-Jupiter NAV print, yet PEGGED. If the premium
+exceeds `NAV_PREMIUM_SANITY_BPS = 1000` (10%) on a direction-sensitive class
+the engine concludes the NAV anchor is broken and forces **UNKNOWN**.
+Legitimate premiums never approach this bound (the widest observed across all
+assets is INF ≈ 160 bps); the discount side and symmetric classes are
+untouched. Code: `thresholds.rs` — `premium_sanity_violated` /
 `NAV_PREMIUM_SANITY_BPS`.
+
+**2. Intrinsic-sanity gate (v0.5.0, ADR-0030)** — `state_reason:
+discount_sanity`. The mirror of the above on the *discount* side: a
+garbage-HIGH intrinsic makes a healthy asset look catastrophically discounted.
+If the discount exceeds `NAV_DISCOUNT_SANITY_BPS = 3000` (30%) on a
+direction-sensitive class, the anchor is treated as broken and the asset is
+published as honest-dark UNKNOWN rather than a false CRITICAL/BLACK_SWAN. The
+motivating incident: JLP on 2026-06-24, where the redemption-rate feed printed
+`21817` against a real value of `3.41`. Provably inert on the live universe —
+the widest genuine direction-sensitive discount observed is 245 bps, two
+orders of magnitude below the bound. Code: `thresholds.rs` —
+`discount_sanity_violated` / `NAV_DISCOUNT_SANITY_BPS`.
+
+**3. Pyth confidence gate (v0.7.0, ADR-0032)** — `state_reason:
+pyth_confidence_gate`. The first two ask "is this number implausible?"; this
+one asks "does the oracle itself admit it is unsure?" When a cached Pyth
+reading an asset depends on — on either the intrinsic or the market leg — has
+a confidence/price ratio wider than `PYTH_CONFIDENCE_GATE_BPS = 500` (5%), the
+verdict is forced to UNKNOWN rather than trusting a possibly-wrong leg.
+
+Unlike gates 1 and 2, this one is **class-agnostic**: a wide confidence
+interval taints the reading regardless of asset class, so there is no
+direction-sensitivity carve-out. `500` is a deliberately conservative starting
+default (5× the cut point of the existing `low` display bucket), not a
+Pyth-mandated constant — Pyth's own guidance frames confidence-interval usage
+as application-dependent. It is replayable offline with no new frozen field,
+because every schema-v2 receipt already freezes the exact Pyth entries the
+asset depended on (`InputsFrozen.pyth_entries`). The display-only
+`pyth_confidence_label` (`high`/`medium`/`low`/`unknown`) is a separate,
+unchanged thing — it does not affect verdicts. Code: `thresholds.rs` —
+`pyth_confidence_gate_violated` / `PYTH_CONFIDENCE_GATE_BPS`.
+
+**Two further `state_reason` values exist that are not spread gates**, and are
+documented here so a receipt's `state_reason` is never unexplained:
+
+- **`intrinsic_liveness` (ADR-0038)** — engine-emitted. The receipt froze
+  `intrinsic_stale = true`: a `sanctum_lst` the directory flags as stale, or a
+  stalled SPL stake-pool crank. The intrinsic number may be arithmetically fine
+  and still be *old*, which the spread gates cannot detect — a stale NAV
+  produces a plausible-looking spread. **Ships disabled by default**
+  (`INTRINSIC_LIVENESS_GATE`), so it appears only on receipts emitted with the
+  gate on.
+- **`stale_source`** — synthesized by the **API layer, not the engine**, when
+  the most recent discount snapshot is older than 15 minutes; the stored state
+  is collapsed to UNKNOWN on read. It is therefore **never present in an engine
+  receipt**: the engine stops writing when data is absent, so a stale row means
+  the engine saw a dead feed rather than that it made a decision. This
+  distinction matters when replaying — a `stale_source` you see on the API is a
+  read-time annotation, not part of any hashed receipt.
 
 ### BLACK_SWAN
 
@@ -182,6 +237,30 @@ last several recompute cycles before applying thresholds. That cuts
 transitions. Code: `crates/methodology/src/ewma.rs` — `apply_ewma_pure`
 (formula: `α × raw + (1 − α) × prev`; seeds at `raw` on cold-start when
 no prior EWMA exists).
+
+**Adversarial-input hardening (v0.6.0 / v0.6.1).** `rust_decimal` *panics* on
+arithmetic overflow rather than returning an error, and this crate is exposed
+to untrusted input through `rederive()` — the public replay CLI hands it
+whatever a receipt file contains. `apply_ewma_pure` therefore returns
+`Option<Decimal>` (the signature change that made 0.6.0 a MINOR), and the
+three downstream consumers that scale to basis points — `premium_sanity_
+violated`, `discount_sanity_violated`, `state_for_bps_discount` — were given
+the same treatment in 0.6.1.
+
+The saturation directions are chosen, not defaulted. The two sanity gates
+treat an overflowing magnitude as **violated**, consistent with their purpose:
+an implausible number should force honest-dark UNKNOWN, never a confident
+verdict. `state_for_bps_discount` saturates to **BlackSwan** — unlike a CR
+ratio, where larger is healthier, a larger discount is always worse, so
+overflow must map to the most alarming band rather than the `0`/PEGGED a naive
+parse-failure default would produce. `state_for_cr` saturates to the
+*healthiest* band for the same reason inverted.
+
+None of this is reachable from the live engine: `discount_raw` is always
+`|d| < 1` before it reaches the EWMA, and by induction so is every subsequent
+EWMA output. **No existing receipt's recorded verdict changes** — only
+pathological inputs that previously crashed the process now return
+`None`/saturate.
 
 ### Hysteresis
 
@@ -259,9 +338,15 @@ The CLI:
 
 1. Fetches `AlertEvidence` from `https://api.pegana.xyz/v1/audit/<UUID>`.
 2. Reads `methodology_version` from the receipt.
-3. Loads the matching version of `pegana-methodology` (this repo
-   pins by git tag — the release tag equals the methodology version it
-   embeds, e.g. `v0.4.0` ships methodology 0.4.0).
+3. Loads the matching version of `pegana-methodology`. The CLI's own
+   release tag is **decoupled** from the methodology version it embeds —
+   the CLI ships fixes without a methodology bump, so e.g. CLI `v0.5.2`
+   embeds methodology `0.7.0`. What a receipt pins is the **embedded
+   methodology version**, not the CLI tag; the methodology crate carries
+   its own `methodology-vX.Y.Z` tags in this repo. A receipt whose
+   `methodology_version` differs from the binary's embedded version exits
+   `3` (VERSION_MISMATCH) rather than silently replaying under today's
+   rules.
 4. Re-hashes the receipt's frozen inputs + recorded verdict using
    `canonical_receipt_hash` and compares to the on-chain-anchored
    canonical hash; checks the anchoring transaction was signed by a
@@ -361,7 +446,7 @@ A few things this design explicitly does not do, with reasons:
 
 | Path | What it is |
 |---|---|
-| [`crates/methodology/`](crates/methodology) | Pure functions implementing this document. Versioned by semver; the CLI release tag equals the methodology version it embeds (e.g. `v0.4.0`), so a receipt's `methodology_version` maps directly to a release tag. |
+| [`crates/methodology/`](crates/methodology) | Pure functions implementing this document. Versioned by semver and tagged independently of the CLI as `methodology-vX.Y.Z`, so a receipt's `methodology_version` maps directly to a tag in this repo. |
 | [`crates/pegana-replay-cli/`](crates/pegana-replay-cli) | The CLI binary that runs the methodology against a fetched receipt. |
 | [`crates/common-verify/`](crates/common-verify) | Config types + `AlertEvidence` schema returned by the API. |
 | [`assets.toml`](assets.toml) | Canonical asset list. Hashed into every receipt. |
