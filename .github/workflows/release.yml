@@ -17,23 +17,38 @@ on:
       - "v*"
       - "methodology-v*"
 
+# Least privilege: the workflow-level default is read-only and each job
+# elevates only what it actually needs. Previously `contents: write` +
+# `attestations: write` + `id-token: write` were granted at the TOP level,
+# which handed the Sigstore signing identity and release-write to every job —
+# including `plan`, which only reads. A compromised step in any job could then
+# have signed an artifact or rewritten a release.
 permissions:
-  contents: write       # gh release upload
-  attestations: write   # attest-build-provenance writes the Sigstore bundle
-  id-token: write       # OIDC token for Sigstore signing
+  contents: read
 
 jobs:
   plan:
     name: Plan release
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with: { submodules: recursive }
 
       - name: Install dist
         run: |
+          # Download, VERIFY, then run. `curl | sh` executes whatever the
+          # server returns — a compromised release asset would run arbitrary
+          # code inside a job that holds the Sigstore signing identity. The
+          # checksum pins the installer the same way the action SHAs pin the
+          # actions.
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.0/cargo-dist-installer.sh | sh
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.0/cargo-dist-installer.sh \
+            -o /tmp/cargo-dist-installer.sh
+          echo "d7eafd08921e0537a8bbc8716cd07f181a97cd2d47fa67abaae2415f24fab8c9  /tmp/cargo-dist-installer.sh" \
+            | shasum -a 256 -c -
+          sh /tmp/cargo-dist-installer.sh
 
       - name: dist plan (gate)
         run: dist plan --output-format=json > plan.json
@@ -58,6 +73,10 @@ jobs:
           # x86_64-apple-darwin (Intel Mac) and x86_64-pc-windows-msvc
           # dropped from v0.1.0 — see Cargo.toml comment for rationale.
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write       # OIDC — Sigstore signing, no key material
+      attestations: write   # attest-build-provenance writes the bundle
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with: { submodules: recursive }
@@ -76,8 +95,17 @@ jobs:
       - name: Install dist
         shell: bash
         run: |
+          # Download, VERIFY, then run. `curl | sh` executes whatever the
+          # server returns — a compromised release asset would run arbitrary
+          # code inside a job that holds the Sigstore signing identity. The
+          # checksum pins the installer the same way the action SHAs pin the
+          # actions.
           curl --proto '=https' --tlsv1.2 -LsSf \
-            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.0/cargo-dist-installer.sh | sh
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.30.0/cargo-dist-installer.sh \
+            -o /tmp/cargo-dist-installer.sh
+          echo "d7eafd08921e0537a8bbc8716cd07f181a97cd2d47fa67abaae2415f24fab8c9  /tmp/cargo-dist-installer.sh" \
+            | shasum -a 256 -c -
+          sh /tmp/cargo-dist-installer.sh
 
       - name: Build artifacts
         shell: bash
@@ -102,6 +130,8 @@ jobs:
     name: Publish GitHub Release
     needs: [plan, build]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write       # gh release create/upload — nothing else needs this
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 

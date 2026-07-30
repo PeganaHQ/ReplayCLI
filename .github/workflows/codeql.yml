@@ -1,0 +1,64 @@
+# CodeQL static analysis.
+#
+# WHY IT BELONGS HERE SPECIFICALLY
+#   `crates/methodology` parses UNTRUSTED input: `rederive()` is handed whatever
+#   a receipt file contains, straight from the public replay CLI. That is
+#   exactly the surface that produced the 0.6.0/0.6.1 panics — rust_decimal
+#   overflows reachable only from adversarial input, found by hand-grepping for
+#   a pattern after the first one bit. Static analysis is the systematic version
+#   of that grep.
+#
+#   Rust support went GA in CodeQL 2.23.3 (Oct 2025) and needs no build mode,
+#   so this stays cheap: no toolchain, no compile step.
+#
+# Free for public repositories.
+#
+# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+# Editing it here is pointless; the next sync overwrites it.
+name: CodeQL
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    # Weekly. Catches newly-published queries against unchanged code, which is
+    # the whole point of a scheduled run on a repo that changes rarely.
+    - cron: '18 5 * * 2'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze Rust
+    runs-on: ubuntu-latest
+    permissions:
+      security-events: write   # upload results to the code-scanning dashboard
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@a2983b8bed1923f44751c5c43237f479442827b3 # v3
+        with:
+          languages: rust
+          build-mode: none
+          # security-extended adds the lower-precision queries. On a
+          # verification tool, a false positive costs a few minutes of triage;
+          # a missed parsing bug costs the tamper-evidence claim.
+          queries: security-extended
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@a2983b8bed1923f44751c5c43237f479442827b3 # v3
+        with:
+          category: "/language:rust"
