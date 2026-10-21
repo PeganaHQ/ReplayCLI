@@ -35,8 +35,10 @@ uuid = { version = "1", features = ["v4", "v7", "serde"] }
 # http
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 
-# solana — required by replay-cli for --verify-onchain
-solana-client = "2.0"
+# solana — required by replay-cli for --verify-onchain. Uses solana-rpc-client
+# (not the monolithic solana-client) to match the private workspace and keep the
+# rustls 0.21 / webpki 0.101 / quinn paths out of the graph.
+solana-rpc-client = "2.0"
 solana-sdk = "2.0"
 
 [profile.release]
@@ -64,7 +66,7 @@ allow-dirty           = ["ci"]
 #   - x86_64-unknown-linux-gnu (ubuntu-latest)
 #   - aarch64-apple-darwin     (macos-14)
 # Dropped from this release:
-#   - x86_64-pc-windows-msvc   : openssl-sys (via solana-client) can't find
+#   - x86_64-pc-windows-msvc   : openssl-sys (via solana-rpc-client) can't find
 #                                OpenSSL on windows-latest. Vendored-openssl
 #                                works but adds 5-10min to every build.
 #   - x86_64-apple-darwin      : the macos-13 (Intel Mac) runner queue is

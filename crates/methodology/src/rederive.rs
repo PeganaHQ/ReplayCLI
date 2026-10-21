@@ -677,4 +677,159 @@ mod tests {
         let expected_smooth = Decimal::from_str("0.0013").unwrap();
         assert_eq!(r.discount_smooth, expected_smooth);
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Property tests.
+    //
+    // WHY THIS MODULE NEEDS THEM MORE THAN ANY OTHER: every other function in
+    // this crate is called by the ENGINE, where the inputs are bounded by
+    // construction (alpha is config, ewma_prev is the engine's own prior,
+    // prices come from validated sources). `rederive()` is the only entry point
+    // fed a value an ADVERSARY CHOOSES — it parses `inputs_frozen` out of a
+    // receipt handed to it by whoever ran `pegana-replay`. Its own doc comments
+    // say so: "`ewma_prev`/`alpha` in the frozen inputs are untrusted and
+    // unbounded (unlike the live engine, where they're always |x| < 1)".
+    //
+    // Yet before this it had 26 example-based tests and ZERO proptests, while
+    // ewma.rs, discount.rs, thresholds.rs, transition.rs, canonical.rs and
+    // receipt.rs all had them. The audit flagged exactly this.
+    //
+    // THE INVARIANT THAT MATTERS IS TOTALITY: for ANY input, `rederive` returns
+    // Ok or a typed Err — never a panic. A panic here is a denial-of-service on
+    // the public verifier CLI, reachable by handing someone a crafted receipt,
+    // and it is the difference between "your receipt is invalid" and "the tool
+    // that proves our honesty crashed".
+    #[cfg(test)]
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        /// Deliberately unbounded: huge magnitudes, negatives, and zero for
+        /// every Decimal, because a receipt is untrusted input.
+        fn arb_decimal() -> impl Strategy<Value = Decimal> {
+            (-1_000_000_000i64..1_000_000_000i64, 0u32..12u32)
+                .prop_map(|(m, scale)| Decimal::new(m, scale))
+        }
+
+        fn arb_state() -> impl Strategy<Value = PegState> {
+            prop_oneof![
+                Just(PegState::Pegged),
+                Just(PegState::Drift),
+                Just(PegState::Depeg),
+                Just(PegState::Critical),
+                Just(PegState::BlackSwan),
+                Just(PegState::Unknown),
+            ]
+        }
+
+        fn arb_class() -> impl Strategy<Value = AssetClass> {
+            prop_oneof![
+                Just(AssetClass::StableFiat),
+                Just(AssetClass::StableCdp),
+                Just(AssetClass::StableDn),
+                Just(AssetClass::StableYield),
+                Just(AssetClass::StableFx),
+                Just(AssetClass::Lst),
+                Just(AssetClass::SynthLev),
+            ]
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(400))]
+
+            /// TOTALITY. No input may panic — `rederive` must always return.
+            /// This is the single most important property in the crate: the
+            /// public `pegana-replay` CLI calls it on receipts it did not
+            /// produce.
+            #[test]
+            fn never_panics_on_arbitrary_frozen_inputs(
+                intrinsic in arb_decimal(),
+                market in arb_decimal(),
+                alpha in arb_decimal(),
+                ewma_prev in proptest::option::of(arb_decimal()),
+                hyusd_cr in proptest::option::of(arb_decimal()),
+                prev in arb_state(),
+                cand in proptest::option::of(arb_state()),
+                class in arb_class(),
+                cr_path in any::<bool>(),
+                drift in 0u32..100_000,
+                depeg in 0u32..100_000,
+                critical in 0u32..100_000,
+            ) {
+                let mut inputs = base_inputs(class, if cr_path { "cr" } else { "bps" });
+                inputs.intrinsic_usd = intrinsic;
+                inputs.market_usd = market;
+                inputs.alpha = alpha;
+                inputs.ewma_prev = ewma_prev;
+                inputs.hyusd_cr = hyusd_cr;
+                inputs.previous_state = prev;
+                inputs.candidate_state = cand;
+                inputs.thresholds = HashMap::from([
+                    ("drift".to_string(), drift),
+                    ("depeg".to_string(), depeg),
+                    ("critical".to_string(), critical),
+                    ("drift_cr".to_string(), drift),
+                    ("depeg_cr".to_string(), depeg),
+                    ("critical_cr".to_string(), critical),
+                    ("black_swan_cr".to_string(), 0),
+                ]);
+
+                // The assertion IS that this line returns rather than unwinds.
+                let _ = rederive(&inputs);
+            }
+
+            /// DETERMINISM. Re-derivation is the product's core claim: the same
+            /// frozen inputs must always reproduce the same verdict, byte for
+            /// byte. A non-deterministic rederive would make every receipt
+            /// unfalsifiable.
+            #[test]
+            fn is_deterministic(
+                intrinsic in arb_decimal(),
+                market in arb_decimal(),
+                ewma_prev in proptest::option::of(arb_decimal()),
+                class in arb_class(),
+            ) {
+                let mut inputs = base_inputs(class, "bps");
+                inputs.intrinsic_usd = intrinsic;
+                inputs.market_usd = market;
+                inputs.ewma_prev = ewma_prev;
+
+                prop_assert_eq!(rederive(&inputs), rederive(&inputs));
+            }
+
+            /// A zero intrinsic can never yield a verdict — it must be the
+            /// typed error, never a divide-by-zero panic or a fabricated state.
+            #[test]
+            fn zero_intrinsic_always_errors(market in arb_decimal()) {
+                let mut inputs = base_inputs(AssetClass::StableFiat, "bps");
+                inputs.intrinsic_usd = Decimal::ZERO;
+                inputs.market_usd = market;
+                inputs.intrinsic_sol = None;
+                inputs.market_sol = None;
+
+                prop_assert_eq!(
+                    rederive(&inputs),
+                    Err(MethodologyRederiveError::IntrinsicZeroOrOverflow)
+                );
+            }
+
+            /// The CR path with no `hyusd_cr` must be the typed error for EVERY
+            /// input shape — never an unwrap on None.
+            #[test]
+            fn cr_path_without_cr_always_errors(
+                intrinsic in arb_decimal(),
+                market in arb_decimal(),
+            ) {
+                let mut inputs = base_inputs(AssetClass::StableCdp, "cr");
+                inputs.thresholds = cr_thresholds();
+                inputs.intrinsic_usd = intrinsic;
+                inputs.market_usd = market;
+                inputs.hyusd_cr = None;
+
+                // Either the discount step rejects it first, or the CR step
+                // does — but it is ALWAYS a typed Err, never a panic.
+                prop_assert!(rederive(&inputs).is_err());
+            }
+        }
+    }
 }

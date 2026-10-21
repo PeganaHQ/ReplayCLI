@@ -1,8 +1,8 @@
-# Pegana — Asset universe. 72 entries; 69 active on mainnet (3 inactive via
-# `active = false`: BRZ, pbUSDC, dSOL). NOTE: calibration status (calibrated vs monitoring_only / beta)
+# Pegana — Asset universe. 72 entries; 68 active on mainnet (4 inactive via
+# `active = false`: BRZ, pbUSDC, dSOL, sharkSOL). NOTE: calibration status (calibrated vs monitoring_only / beta)
 # is NOT declared in this file — it is set by DB migrations (0048+); do not infer
 # the beta split from here. Keep these counts in sync when adding entries or
-# flipping `active`. Last updated 2026-07-19.
+# flipping `active`. Last updated 2026-08-10.
 #
 # Each asset declares:
 #   - identity:        symbol, mint, name, decimals, token_program
@@ -579,7 +579,7 @@ peg_target     = "EUR"
 # usually still reachable (see scripts/calibration-monitor.sql FX caveat).
 # SCOPE (verified live: EURC is monitoring_only=true since the Phase-0 launch —
 # migration 0048, "zero calibration history"): the weekend freeze does NOT reach
-# public alert egress (/v1/alerts etc. exclude monitoring_only) and no alert
+# public alert egress (the former /v1/alerts feed excluded monitoring_only; /v1/audit now lists them) and no alert
 # fires (state doesn't transition). EURC IS still DISPLAYED on the web (screener
 # + asset-detail) with a MONITORING badge; during the dark window the asset-detail
 # StaleBanner shows a calm "FX market closed — expected, not an outage" variant
@@ -876,6 +876,15 @@ intrinsic = { kind = "sanctum_lst", symbol = "sharkSOL" }
 market = { kind = "jupiter_usd", numeraire = "SOL", numeraire_feed = "SOL/USD" }
 pyth_feed_id = ""
 thresholds_bps = { drift = 55, depeg = 140, critical = 300 }
+# Deactivated 2026-08-10 (migration 0076). The stake pool
+# HQLwnQJFH7t9nBTP4vbdW4eHy62aecfDnj8te8VzqkFL is abandoned: read at network
+# epoch 1014 its last_update_epoch was 1002 (12 epochs behind, roughly a month)
+# and it holds 1.88 SOL in total, about $142. Healthy pools update every epoch —
+# bSOL and laineSOL both read 1014 in the same query. Because the pool never
+# updates, its rate cannot advance and Sanctum keeps serving the last value it
+# computed, so Pegana was publishing PEGGED / high confidence / risk_score 0
+# against a dead pool. Reactivate if it resumes updating.
+active = false
 
 [[assets]]
 symbol = "BulkSOL"
