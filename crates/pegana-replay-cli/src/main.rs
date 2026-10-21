@@ -767,7 +767,7 @@ async fn verify_onchain(
     let tx_sig_str = body["tx_sig"].as_str().context("tx_sig missing")?;
 
     // 2) Parse the signature + connect to Solana RPC.
-    use solana_client::nonblocking::rpc_client::RpcClient;
+    use solana_rpc_client::nonblocking::rpc_client::RpcClient;
     use solana_sdk::commitment_config::CommitmentConfig;
     use solana_sdk::signature::Signature;
     use solana_transaction_status::{
