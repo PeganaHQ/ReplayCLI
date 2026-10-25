@@ -18,13 +18,12 @@ publishing others' private information.
 
 ## Scope
 
-Applies to this repository's issues, pull requests, discussions, and the
-Telegram channel used for reports and feedback.
+Applies to this repository's issues, pull requests and discussions, and to the
+same spaces on [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana).
 
 ## Reporting
 
-Report conduct issues to **rafael@pegana.xyz**, or privately via
-[@PeganaWatchBot](https://t.me/PeganaWatchBot). Reports are handled by the
+Report conduct issues to **rafael@pegana.xyz**. Reports are handled by the
 maintainer and kept confidential.
 
 Note this is a *conduct* channel. **Security vulnerabilities go through

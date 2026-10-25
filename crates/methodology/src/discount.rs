@@ -3,6 +3,19 @@
 use pegana_common_verify::AssetClass;
 use rust_decimal::Decimal;
 
+/// Whether the discount is computed in SOL terms (the SOL/USD multiplier
+/// cancels): an LST with both SOL legs present and a non-zero SOL intrinsic. The
+/// single predicate shared by [`compute_discount`] and the engine's Pyth gate.
+pub fn uses_sol_path(
+    class: AssetClass,
+    intrinsic_sol: Option<Decimal>,
+    market_sol: Option<Decimal>,
+) -> bool {
+    matches!(class, AssetClass::Lst)
+        && market_sol.is_some()
+        && intrinsic_sol.is_some_and(|i| !i.is_zero())
+}
+
 /// Compute signed discount `1 - market/intrinsic`.
 ///
 /// For LST class we prefer the SOL-denominated path when both sides have
@@ -26,16 +39,14 @@ pub fn compute_discount(
     if intrinsic.is_zero() {
         return None;
     }
-    if matches!(class, AssetClass::Lst) {
+    if uses_sol_path(class, intrinsic_sol, market_sol) {
         if let (Some(i_sol), Some(m_sol)) = (intrinsic_sol, market_sol) {
-            if !i_sol.is_zero() {
-                // Checked: a near-zero `i_sol` overflows Decimal on divide, which
-                // rust_decimal's `/` PANICS on — inline in the engine loop, that
-                // kills the whole process (audit F-12). None = skip (H8), never crash.
-                return m_sol
-                    .checked_div(i_sol)
-                    .and_then(|q| Decimal::ONE.checked_sub(q));
-            }
+            // Checked: a near-zero `i_sol` overflows Decimal on divide, which
+            // rust_decimal's `/` PANICS on — inline in the engine loop, that
+            // kills the whole process (audit F-12). None = skip (H8), never crash.
+            return m_sol
+                .checked_div(i_sol)
+                .and_then(|q| Decimal::ONE.checked_sub(q));
         }
     }
     // Checked: a micro-but-nonzero `intrinsic` (e.g. a Hylo CR<1 xSOL NAV ≈ 1e-27

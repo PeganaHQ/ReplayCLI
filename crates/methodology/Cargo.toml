@@ -1,6 +1,6 @@
 [package]
 name        = "pegana-methodology"
-version     = "0.7.0"
+version     = "0.8.0"
 edition     = "2021"
 description = "Pure, versioned methodology functions for Pegana's peg-risk engine. Used by the engine at runtime and by pegana-replay-cli for offline verification."
 license     = "MIT"

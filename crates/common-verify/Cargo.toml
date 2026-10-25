@@ -1,6 +1,6 @@
 [package]
 name        = "pegana-common-verify"
-version     = "0.1.0"
+version     = "0.1.1"
 edition     = "2021"
 description = "Public, verifier-safe types shared between Pegana's methodology crate, replay CLI, and engine. Carve-out of pegana-common containing only what's needed to parse assets.toml and validate audit receipts — no server-side runtime types, no Redis channels, no webhook crypto, no Sentry init."
 license     = "MIT"

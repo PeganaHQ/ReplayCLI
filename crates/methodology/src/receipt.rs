@@ -63,6 +63,27 @@ pub struct InputsFrozen {
     /// provably unchanged. Additive + serde-default so old receipts deserialize.
     #[serde(default, skip_serializing_if = "is_false")]
     pub intrinsic_stale: bool,
+    /// Market-availability gate: the market source reported consecutive missing
+    /// quotes, so the frozen market leg is a last-known value that must not
+    /// support a confident peg. Forces UNKNOWN in the shared override. The
+    /// engine only sets this when the dark-market gate is enabled; `false` is
+    /// omitted from the canonical hash so every existing receipt stays
+    /// byte-exact. Additive + serde-default so old receipts deserialize.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub market_unavailable: bool,
+    /// Premium-confirmation gate (ADR-0047): the market leg is a PREMIUM beyond
+    /// the drift band that no second source confirmed. A symmetric class is then
+    /// capped at DRIFT; a direction-sensitive class holds a committed DEPEG+ band
+    /// instead of relaxing on it. Set by the engine only when the gate is
+    /// enabled; `false` is omitted from the canonical hash, so existing receipts
+    /// are byte-exact. Additive + serde-default.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub premium_unconfirmed: bool,
+    /// With `premium_unconfirmed`, the highest band a SYMMETRIC class may reach: the
+    /// state the independent reference itself implies (never below DRIFT). `None`
+    /// means no reference, so the cap is DRIFT. Omitted from the hash when `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub premium_cap: Option<PegState>,
 }
 
 /// Engine output frozen into the receipt. Same NO-FLOATS invariant as
@@ -94,6 +115,11 @@ pub struct Receipt {
     /// - `premium_sanity` — engine NAV-sanity override: smoothed discount exceeded
     ///   the premium-sanity bound, intrinsic anchor is suspect, state forced to
     ///   UNKNOWN (see `pegana_methodology::STATE_REASON_PREMIUM_SANITY`).
+    /// - `discount_sanity`, `pyth_confidence_gate`, `intrinsic_liveness` — the
+    ///   other engine override gates (see the matching `STATE_REASON_*` consts).
+    /// - `market_unavailable` — engine dark-market gate (ADR-0046, opt-in): the
+    ///   market source stopped reporting, state forced to UNKNOWN. The API layer
+    ///   also synthesizes this string for a stale row (not in receipts).
     /// - `stale_source` — API layer: feed is >15 min stale, state collapsed to
     ///   UNKNOWN by the API (not in receipts; see `STATE_REASON_STALE_SOURCE`).
     ///
@@ -148,6 +174,9 @@ mod tests {
             confirm_up_secs: 30,
             decay_down_secs: 120,
             intrinsic_stale: false,
+            market_unavailable: false,
+            premium_unconfirmed: false,
+            premium_cap: None,
         }
     }
 

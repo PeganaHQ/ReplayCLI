@@ -47,6 +47,9 @@ curl --proto '=https' --tlsv1.2 -LsSf \
   https://releases.pegana.xyz/pegana-replay-installer.sh | sh
 ```
 
+The installer verifies the build attestation before installing, so it needs the
+[GitHub CLI](https://cli.github.com) (`gh`). Without it, use `cargo install pegana-replay --locked`.
+
 <details>
 <summary>Other install methods</summary>
 
@@ -122,16 +125,24 @@ Note `4` vs `5`: a severe transition with no anchor reports `ONCHAIN_INCOMPLETE`
 | `METHODOLOGY.md` | Long-form prose companion to `crates/methodology`. The code is authoritative; this explains it. |
 | `.github/workflows/release.yml` | `cargo-dist` pipeline. Publishes attested binaries on every `v*` tag, signed via GitHub-issued OIDC (no key material). |
 
-**Not here:** the engine, dispatcher, indexer, API, MCP server, Telegram bot, on-chain commit
-pipeline and webhook signing live in a closed sibling repo. Closed for operational reasons — but
-**every decision they produce is reproducible from this repo** against the alert's receipt.
+**Not here:** the engine, dispatcher, indexers, API, MCP server and on-chain commit
+pipeline. They are open source too, in the oracle repository
+[PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana) (MIT). Pegana is open-core: the
+pegana.xyz website (marketing site and web app), its design system, the Pegana name, logo
+and wordmark, and the production operations tooling are proprietary and in neither
+repository. This repo is the verifier subset,
+mirrored from it so you can audit and build the CLI without the rest of the stack, and
+**every decision the engine produces is reproducible from this repo** against the alert's receipt.
 
 ## Verifying the binary itself
 
 Release binaries carry Sigstore build provenance issued by this repo's CI:
 
 ```sh
-gh attestation verify ~/.pegana/bin/pegana-replay --repo PeganaHQ/ReplayCLI
+gh attestation verify 'pegana-replay-<target>.tar.xz' \
+  --repo PeganaHQ/ReplayCLI \
+  --signer-workflow PeganaHQ/ReplayCLI/.github/workflows/release.yml \
+  --source-ref 'refs/tags/<tag>'
 ```
 
 > **Binaries tagged `v0.4.4` and earlier** were built before this repo moved to the `PeganaHQ` org
@@ -158,9 +169,10 @@ disclosure — a bug here could let a tampered receipt verify as clean.
 
 ## Contributing
 
-This repo is a **one-way mirror**, automatically generated from a closed sibling repo and
-force-pushed. Direct commits are overwritten on the next sync. See
-[CONTRIBUTING.md](CONTRIBUTING.md) for how to actually get a change landed, and
+This repo is a **one-way mirror** of the verifier paths of
+[PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana), updated automatically by a sync pull
+request. Changes made only here are overwritten on the next sync, so changes land upstream. See
+[CONTRIBUTING.md](CONTRIBUTING.md) for how to get a change landed, and
 [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) for the ground rules.
 
 Disagreeing with a verdict is not a complaint — it's the intended use. Bring the alert id and
@@ -180,8 +192,9 @@ MIT — see [LICENSE](LICENSE).
 
 ## Links
 
-- **Site & live audit ledger** — [www.pegana.xyz](https://www.pegana.xyz)
-- **Install mirror** — [releases.pegana.xyz](https://releases.pegana.xyz)
-- **API** — [api.pegana.xyz](https://api.pegana.xyz) · [OpenAPI](https://api.pegana.xyz/openapi.json)
-- **Telegram** — [@PeganaWatchBot](https://t.me/PeganaWatchBot)
-- **X** — [@PeganaHQ](https://x.com/PeganaHQ)
+- **Site & live audit ledger**: [www.pegana.xyz](https://www.pegana.xyz)
+- **Install mirror**: [releases.pegana.xyz](https://releases.pegana.xyz)
+- **API**: [api.pegana.xyz](https://api.pegana.xyz) · [OpenAPI](https://api.pegana.xyz/openapi.json)
+- **Source**: [github.com/PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana) · [issues](https://github.com/PeganaHQ/Pegana/issues)
+- **Email**: [rafael@pegana.xyz](mailto:rafael@pegana.xyz)
+- **X**: [@PeganaHQ](https://x.com/PeganaHQ)

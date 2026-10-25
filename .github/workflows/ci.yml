@@ -1,8 +1,8 @@
 # Public CI for the mirrored tree.
 #
-# WHY THIS EXISTS AT ALL, on a repo nobody can send PRs to:
-# the mirror is assembled by subtree-split + read-tree in the private repo,
-# so "it builds in the private monorepo" does NOT prove "the published tree
+# WHY THIS EXISTS AT ALL, on a repo whose changes land upstream:
+# the mirror is assembled by subtree-split + read-tree in PeganaHQ/Pegana,
+# so "it builds in PeganaHQ/Pegana" does NOT prove "the published tree
 # builds standalone". This workflow is the only thing that proves the code a
 # third party actually downloads compiles, passes its tests, and matches its
 # committed lockfile. That proof is the product here.
@@ -11,7 +11,7 @@
 # ships a tree with a dangling path dependency or a stale Cargo.lock, this
 # goes red on the sync commit itself.
 #
-# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+# NOTE: mirrored from tools/pegana-replay-public/ in PeganaHQ/Pegana.
 # Editing it here is pointless; the next sync overwrites it.
 name: CI
 
