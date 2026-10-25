@@ -82,7 +82,7 @@ pegana-replay --bundle ./replay-bundle.json
 # One machine-readable line on stdout; exit code unchanged
 pegana-replay --alert-id <UUID> --json
 # {"status":"PASS","exit_code":0,"asset":"jitoSOL","previous_state":"Pegged",
-#  "final_state":"Pegged","methodology_version":"0.7.0","receipt_sha256":"…","alert_id":"…"}
+#  "final_state":"Pegged","methodology_version":"0.8.0","receipt_sha256":"…","alert_id":"…"}
 ```
 
 **No install?** Open `https://www.pegana.xyz/audit/<alert-id>` — the in-browser `ReceiptVerifier`
@@ -158,6 +158,11 @@ What matters for replay is the **embedded methodology version**, not the CLI tag
 the `methodology_version` it was produced under; to read an old receipt, install the CLI build that
 embeds *that* methodology and replay against it **as it was at the time**. The CLI enforces this — a
 mismatch exits `3` with a hint, rather than silently replaying under today's rules.
+
+| Receipt methodology | Install the CLI with |
+|---|---|
+| 0.8.x | `cargo install pegana-replay --locked` (latest, 0.6.0) |
+| 0.7.0 | `cargo install pegana-replay@0.5.2 --locked` |
 
 Each `v*` tag builds `x86_64-unknown-linux-gnu` and `aarch64-apple-darwin`. Intel Mac and Windows
 build from source.
