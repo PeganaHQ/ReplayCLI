@@ -1,4 +1,4 @@
-# Pegana methodology — v0.7.0
+# Pegana methodology — v0.8.0
 
 How peg-risk signals are produced, why this design over the obvious
 alternatives, and what every load-bearing piece of the math is doing.
@@ -182,7 +182,7 @@ asset depended on (`InputsFrozen.pyth_entries`). The display-only
 unchanged thing — it does not affect verdicts. Code: `thresholds.rs` —
 `pyth_confidence_gate_violated` / `PYTH_CONFIDENCE_GATE_BPS`.
 
-**Two further `state_reason` values exist that are not spread gates**, and are
+**Three further `state_reason` values exist that are not spread gates**, and are
 documented here so a receipt's `state_reason` is never unexplained:
 
 - **`intrinsic_liveness` (ADR-0038)** — engine-emitted. The receipt froze
@@ -192,6 +192,24 @@ documented here so a receipt's `state_reason` is never unexplained:
   produces a plausible-looking spread. **Ships disabled by default**
   (`INTRINSIC_LIVENESS_GATE`), so it appears only on receipts emitted with the
   gate on.
+- **`market_unavailable` (ADR-0046, v0.8.0)** — engine-emitted when the market
+  source reported consecutive missing quotes. The receipt froze
+  `market_unavailable = true` and the verdict is forced to UNKNOWN (a confirmed
+  BLACK_SWAN yields; collateral-ratio assets are exempt). `false` is omitted from
+  the hash, so every earlier receipt is unchanged. **Ships disabled by default**
+  (`DARK_MARKET_GATE_ENABLED`). The API layer also uses this string for a stale
+  row, which is not in a receipt.
+- **`market_reference_divergence`, `depth_below_floor` (ADR-0047, v0.8.0)** — engine-emitted
+  through the same frozen `market_unavailable` input: the market print disagreed with an
+  independent Pyth spot reference, or sat on a venue below the depth floor. **Disabled by
+  default** (`MARKET_REFERENCE_GATE_BPS`, `DEPTH_VERDICT_GATE`).
+- **Premium confirmation (ADR-0047, v0.8.0)** — a frozen `premium_unconfirmed = true` means a
+  market premium above the drift band was not confirmed by a second source. It acts on the
+  *candidate* before the time hysteresis: a symmetric class is capped at DRIFT, and an LST or
+  yield stable keeps a committed DEPEG-or-worse band instead of starting a relaxation. No separate
+  `state_reason`. **Disabled by default** (`PREMIUM_CONFIRMATION_GATE`); `false` is omitted from
+  the hash. Like `market_unavailable`, it is an *asserted* input: a receipt proves the verdict
+  follows from the frozen flag, not that the engine's reference price justified setting it.
 - **`stale_source`** — synthesized by the **API layer, not the engine**, when
   the most recent discount snapshot is older than 15 minutes; the stored state
   is collapsed to UNKNOWN on read. It is therefore **never present in an engine
@@ -382,12 +400,12 @@ Together these prevent backdating: the engine can't claim it
 decided 2 hours ago about an event that just happened, because the
 Memo commit would have a block_time later than the receipt's
 `detected_at`. Code: `crates/methodology/src/canonical.rs` (the
-hash function) + the engine's `onchain_commit.rs` in the closed
-sibling repo.
+hash function) + the engine's `crates/engine-rs/src/onchain_commit.rs` in
+[PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana).
 
 Note: the anti-backdating enforcement (`block_time > detected_at` check)
-runs inside the closed sibling repo's engine and is therefore not
-verifiable from this public repo. The hash itself — which you can
+runs inside the engine (in [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana),
+not in this verifier subset), so this CLI does not re-check it. The hash itself — which you can
 reproduce from this repo's `canonical_receipt_hash` — is what you verify;
 the block_time ordering is confirmable directly from the Solana explorer
 for any `onchain_tx_sig`.
@@ -450,10 +468,12 @@ A few things this design explicitly does not do, with reasons:
 | [`crates/pegana-replay-cli/`](crates/pegana-replay-cli) | The CLI binary that runs the methodology against a fetched receipt. |
 | [`crates/common-verify/`](crates/common-verify) | Config types + `AlertEvidence` schema returned by the API. |
 | [`assets.toml`](assets.toml) | Canonical asset list. Hashed into every receipt. |
-| [`docs/adr/`](docs/adr) | ADRs that decided each load-bearing methodology choice, dated and rationalised. |
+| [`docs/adr/`](https://github.com/PeganaHQ/Pegana/tree/main/docs/adr) (upstream, not mirrored here) | ADRs that decided each load-bearing methodology choice, dated and rationalised. |
 
-The engine that runs this methodology in production (the closed
-sibling repo) is **not** in scope for this document. What that engine
+The engine that runs this methodology in production (open source under MIT in the
+oracle repository [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana), outside this
+verifier subset) is
+**not** in scope for this document. What that engine
 must do is produce, for each state transition, an `AlertEvidence`
 that this methodology can verify. As long as that happens, the
 engine is interchangeable — anyone could write their own
@@ -470,4 +490,4 @@ That's the point of separating the math from the runtime.
 - Audit ledger (live receipts post 2026-06-11 verdict gate):
   <https://www.pegana.xyz/audit>
 - Install verifier: <https://releases.pegana.xyz>
-- Telegram for questions: [@PeganaWatchBot](https://t.me/PeganaWatchBot)
+- Questions and issues: [github.com/PeganaHQ/Pegana/issues](https://github.com/PeganaHQ/Pegana/issues)

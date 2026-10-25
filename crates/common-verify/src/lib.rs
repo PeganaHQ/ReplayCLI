@@ -23,6 +23,170 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Remove complete HTTP URLs from transport errors before logging or persisting
+/// them. RPC credentials can appear in either the query string or path.
+pub fn redact_urls_in_error(error: impl std::fmt::Display) -> String {
+    let input = error.to_string();
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input.as_str();
+    loop {
+        // ASCII case folding preserves byte offsets into the original string.
+        let lower = rest.to_ascii_lowercase();
+        let start = [
+            "https://",
+            "http://",
+            "wss://",
+            "ws://",
+            "https%3a%2f%2f",
+            "http%3a%2f%2f",
+        ]
+        .into_iter()
+        .filter_map(|scheme| lower.find(scheme))
+        .min();
+        let Some(start) = start else {
+            output.push_str(rest);
+            break;
+        };
+        output.push_str(&rest[..start]);
+        let url = &rest[start..];
+        let end = url
+            .find(|c: char| c.is_whitespace() || matches!(c, ')' | ']' | '}' | '>' | '"' | '\''))
+            .unwrap_or(url.len());
+        output.push_str("<redacted-url>");
+        rest = &url[end..];
+    }
+    redact_key_fragments(&output)
+}
+
+/// Consecutive missed Jupiter polls before a market is reported dark.
+pub const DARK_POLLS: u64 = 3;
+/// Lower bound for the dark-market staleness window.
+pub const DARK_MARKET_WINDOW_FLOOR_SECS: i64 = 120;
+
+/// Staleness window for Jupiter quotes under the dark-market gate:
+/// `max(floor, (DARK_POLLS + 1) × ceil(assets / concurrency) × tick)`.
+/// One full round-robin cycle takes `ceil(assets / concurrency)` ticks, so the
+/// window must cover several cycles or a healthy asset (or a single 429) reads
+/// as dark. The indexer and the engine both call this, so they agree.
+pub fn dark_market_window_secs(assets: usize, concurrency: usize, tick_ms: u64) -> i64 {
+    let slots = assets.div_ceil(concurrency.max(1)) as u64;
+    let cycle_ms = slots.saturating_mul(tick_ms);
+    let window_ms = (DARK_POLLS + 1).saturating_mul(cycle_ms);
+    let secs = i64::try_from(window_ms.div_ceil(1000)).unwrap_or(i64::MAX);
+    secs.max(DARK_MARKET_WINDOW_FLOOR_SECS)
+}
+
+const KEY_MASK: &str = "<redacted>";
+
+/// Mask credential-looking `key=value` fragments that survive without a URL
+/// scheme (for example a query string quoted on its own).
+fn redact_key_fragments(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut rest = input;
+    loop {
+        let lower = rest.to_ascii_lowercase();
+        let next = ["api-key=", "apikey=", "key=", "token="]
+            .into_iter()
+            .filter_map(|key| lower.find(key).map(|start| (start, key.len())))
+            .min_by_key(|(start, _)| *start);
+        let Some((start, key_len)) = next else {
+            output.push_str(rest);
+            break;
+        };
+        let value = &rest[start + key_len..];
+        // Already-masked values stay as they are, so the function is idempotent.
+        let end = if value.starts_with(KEY_MASK) {
+            KEY_MASK.len()
+        } else {
+            value
+                .find(|c: char| {
+                    c.is_whitespace()
+                        || matches!(c, '&' | ')' | ']' | '}' | '>' | '"' | '\'' | ',' | ';')
+                })
+                .unwrap_or(value.len())
+        };
+        output.push_str(&rest[..start + key_len]);
+        output.push_str(KEY_MASK);
+        rest = &value[end..];
+    }
+    output
+}
+
+#[cfg(test)]
+mod rpc_redaction_tests {
+    use super::*;
+
+    #[test]
+    fn redacts_keyed_rpc_urls_in_query_and_path() {
+        let message = "primary https://rpc.example/key-one?api-key=secret-one, fallback (https://rpc.example/key-two) failed";
+        let redacted = redact_urls_in_error(message);
+        assert_eq!(
+            redacted,
+            "primary <redacted-url> fallback (<redacted-url>) failed"
+        );
+        assert!(!redacted.contains("secret-one") && !redacted.contains("key-two"));
+    }
+
+    #[test]
+    fn redacts_case_variants_websocket_and_encoded_scheme() {
+        for message in [
+            "HTTPS://rpc.example/FIXTURE_TOKEN",
+            "wss://rpc.example/FIXTURE_TOKEN",
+            "HtTp://rpc.example/?api-key=FIXTURE_TOKEN",
+            "HTTPS%3A%2F%2Frpc.example%2FFIXTURE_TOKEN",
+            "ws://rpc.example/FIXTURE_TOKEN",
+            "api-key=FIXTURE_TOKEN",
+        ] {
+            assert!(
+                !redact_urls_in_error(message).contains("FIXTURE_TOKEN"),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn dark_window_covers_full_cycles_and_respects_the_floor() {
+        // 61 assets, concurrency 1, 2.5 s tick: 152.5 s per cycle, 4 cycles.
+        assert_eq!(dark_market_window_secs(61, 1, 2_500), 610);
+        assert_eq!(dark_market_window_secs(61, 2, 2_500), 310);
+        assert_eq!(
+            dark_market_window_secs(4, 4, 1_000),
+            DARK_MARKET_WINDOW_FLOOR_SECS
+        );
+        assert_eq!(
+            dark_market_window_secs(0, 0, 0),
+            DARK_MARKET_WINDOW_FLOOR_SECS
+        );
+    }
+
+    #[test]
+    fn redacts_bare_http_url() {
+        assert_eq!(
+            redact_urls_in_error("connect http://10.0.0.1:8899/FIXTURE_TOKEN refused"),
+            "connect <redacted-url> refused"
+        );
+    }
+
+    #[test]
+    fn redaction_is_idempotent() {
+        for message in [
+            "primary https://rpc.example/?api-key=FIXTURE_TOKEN failed",
+            "query api-key=FIXTURE_TOKEN&token=FIXTURE_TOKEN",
+        ] {
+            let once = redact_urls_in_error(message);
+            assert_eq!(redact_urls_in_error(&once), once);
+        }
+    }
+
+    #[test]
+    fn leaves_unrelated_text_unchanged() {
+        assert_eq!(
+            redact_urls_in_error("rpc timeout without an endpoint"),
+            "rpc timeout without an endpoint"
+        );
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum AssetClass {
@@ -181,7 +345,7 @@ pub enum IntrinsicStrategy {
     },
     /// Generic Pyth-published redemption-rate / NAV feed (suffix `.RR`). Used
     /// for any wrapped/yield-bearing asset whose issuer publishes its NAV via
-    /// Pyth (e.g. USDY/USD.RR — Ondo's official on-chain redemption rate).
+    /// Pyth (e.g. SYRUPUSDC/USDC.RR, Maple's official redemption rate).
     /// The indexer routes the cached feed price into `intrinsic_snapshots`
     /// and the engine consumes it directly — no per-issuer adapter needed.
     PythRedemptionRate {
@@ -191,9 +355,9 @@ pub enum IntrinsicStrategy {
     // Phase A: yield-bearing stable adapters (one variant per issuer for
     // type-safe verify-assets and explicit account/program addresses).
 
-    // Ethena sUSDe: Task 9 found that Ethena publishes per-share NAV to Pyth
-    // as `Crypto.SUSDE/USDE.RR`, covered by the generic PythRedemptionRate
-    // variant. EthenaSusdeRate variant removed to keep the enum dead-code-free.
+    // Ethena sUSDe: originally read from Pyth `Crypto.SUSDE/USDE.RR`. That
+    // feed is not available on Solana without paid Hermes, so since 2026-10
+    // sUSDe (and USDY) read the issuer contract directly via `EvmViewNav`.
 
     // Maple syrupUSDC: Task 7 found that Maple publishes the official
     // syrupUSDC redemption rate to Pyth as `Crypto.SYRUPUSDC/USDC.RR`, so the
@@ -207,12 +371,49 @@ pub enum IntrinsicStrategy {
         program: String,
     },
 
-    /// Perena USD* savings-vault share token. NAV is stored in the reserve
-    /// account at offset 352 and cross-checked against total_underlying /
-    /// share_supply at offsets 192 / 200 to detect silent layout shifts.
-    PerenaUsdStarNav {
-        reserve: String,
+    /// Perena USD* share token, post-migration (2026-10). NAV is the
+    /// `accounting.mint_share_price` (u64, 6dp) of the `bankineco` Vault
+    /// account (bytemuck, IDL-decoded) that is the USD* mint authority.
+    /// Liveness is the vault's `accounting.last_update_ts` (crank_nav, ~5 min).
+    PerenaVaultNav {
+        vault: String,
         program: String,
+    },
+
+    /// Jupiter Perpetuals LP (JLP). NAV = Pool `aum_usd` (u128, 6dp) / JLP
+    /// mint supply (6dp), both read in one `getMultipleAccounts` so the pair
+    /// is slot-consistent. `pool` is owned by `program`; the LP mint is the
+    /// asset's own `mint`.
+    JupiterPerpsPoolNav {
+        pool: String,
+        program: String,
+    },
+
+    /// Issuer NAV read from an Ethereum mainnet `eth_call` to a view function
+    /// (e.g. Ondo RWADynamicOracle `getPrice()`, ERC-4626 `convertToAssets`).
+    /// `calldata` is the full hex call data (selector + ABI-encoded args);
+    /// the uint256 result is scaled by `10^decimals`. Read from >= 1 public
+    /// RPC; when two answer, they must agree within `max_divergence_bps`.
+    EvmViewNav {
+        contract: String,
+        calldata: String,
+        decimals: u32,
+        #[serde(default = "default_evm_max_divergence_bps")]
+        max_divergence_bps: u32,
+        #[serde(default = "default_evm_max_block_age_secs")]
+        max_block_age_secs: i64,
+    },
+
+    /// Fiat FX rate (e.g. EUR/USD, quoted as USD per 1 unit of `base`) taken
+    /// as the median of free public venues (Kraken ticker mid, Coinbase
+    /// exchange-rates). Rejected when the venues diverge by more than
+    /// `max_divergence_bps`. Not published while the FX market is closed
+    /// (the forex weekend), matching the previous Pyth FX behaviour.
+    FxHttpMedian {
+        base: String,
+        quote: String,
+        #[serde(default = "default_fx_max_divergence_bps")]
+        max_divergence_bps: u32,
     },
 
     // OnRe ONyc: Task 8 found that OnRe publishes ONyc's NAV directly to Pyth
@@ -227,6 +428,18 @@ pub enum IntrinsicStrategy {
     // StreamflowUsdPlus deferred to v1.5 — USD+ not yet live on mainnet as of
     // 2026-05-22 (Streamflow announced 2025-12-24, waitlist still open).
     // Re-add this variant when the mint ships.
+}
+
+fn default_evm_max_divergence_bps() -> u32 {
+    10
+}
+
+fn default_evm_max_block_age_secs() -> i64 {
+    180
+}
+
+fn default_fx_max_divergence_bps() -> u32 {
+    10
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,6 +505,13 @@ pub struct AssetConfig {
     /// (e.g. Jupiter TOKEN_NOT_TRADABLE) or for v1.5 placeholders.
     #[serde(default = "default_active")]
     pub active: bool,
+    /// Jupiter DEX labels to exclude from this asset's quotes (sent as
+    /// `excludeDexes`). Used to keep the market leg independent of the
+    /// intrinsic leg: an issuer's own mint/redeem route (e.g. "Perena Star V2"
+    /// for USD*, "Perps" for JLP) prices the token AT its NAV by construction,
+    /// so it can never reveal a discount.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jupiter_exclude_dexes: Vec<String>,
 }
 
 fn default_active() -> bool {

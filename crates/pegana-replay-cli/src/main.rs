@@ -122,6 +122,7 @@ const CLI_BUILD_FOR_METHODOLOGY: &[(&str, &str)] = &[
     ("0.5.0", "0.4.2"),
     ("0.6.0", "0.4.3"),
     ("0.6.1", "0.4.4"),
+    ("0.7.0", "0.5.2"),
 ];
 
 /// The published CLI build embedding `methodology_ver`, if one exists.
@@ -152,7 +153,7 @@ fn parse_semver(v: &str) -> Option<(u64, u64, u64)> {
 /// than this build means the user is behind and should update; anything else
 /// predates the first publish and is honestly reported as unverifiable from
 /// published artifacts.
-fn version_mismatch_hint(receipt_ver: &str, embedded_ver: &str) -> String {
+fn version_mismatch_hint(receipt_ver: &str, embedded_ver: &str, alert_id: Option<&Uuid>) -> String {
     if let Some(cli) = cli_build_for_methodology(receipt_ver) {
         return format!(
             "Install the build that embeds methodology v{receipt_ver}:\n  \
@@ -166,12 +167,28 @@ fn version_mismatch_hint(receipt_ver: &str, embedded_ver: &str) -> String {
             "This receipt is NEWER than your CLI (methodology v{receipt_ver} vs v{embedded_ver}).\n  \
              cargo install pegana-replay --locked          # update to the latest release"
         ),
-        _ => format!(
-            "No published build embeds methodology v{receipt_ver}. The verifier crates were first \
-             published on 2026-07-01 at methodology 0.4.0, so this receipt predates every published \
-             artifact and cannot be verified from crates.io. Its hash and on-chain anchor are still \
-             intact — see https://pegana.xyz/methodology for the version history."
-        ),
+        _ => {
+            // This branch knows nothing about the receipt's anchor (and most
+            // pre-0.4.0 receipts are DRIFT transitions, which are never
+            // anchored), so it must not claim one. Point at the page that can
+            // actually check the hash for this receipt instead.
+            let check = match alert_id {
+                Some(id) => format!(
+                    "Check its hash in the browser at https://www.pegana.xyz/audit/{id} (that page \
+                     also shows whether the receipt has an on-chain anchor)."
+                ),
+                None => "Check its hash in the browser from the receipt's page on \
+                         https://www.pegana.xyz/audit (that page also shows whether the receipt \
+                         has an on-chain anchor)."
+                    .to_string(),
+            };
+            format!(
+                "No published build embeds methodology v{receipt_ver}. The verifier crates were first \
+                 published on 2026-07-01 at methodology 0.4.0, so this receipt predates every published \
+                 artifact and cannot be re-derived from crates.io. {check} Version history: \
+                 https://www.pegana.xyz/methodology"
+            )
+        }
     }
 }
 
@@ -416,7 +433,7 @@ async fn run() -> Result<()> {
     // Hash + re-derivation check. Exits 1 (tamper) / 3 (version) internally
     // (json-aware). An Err here is ERROR-class (unsupported schema, hash-compute
     // or re-derive error) → exit 2.
-    if let Err(e) = verify(&receipt, cli.quiet, cli.json) {
+    if let Err(e) = verify(&receipt, cli.alert_id.as_ref(), cli.quiet, cli.json) {
         if cli.json {
             emit_json_and_exit(
                 "error",
@@ -519,23 +536,127 @@ async fn resolve_receipt(cli: &Cli) -> Result<Receipt> {
     }
 }
 
+/// Connect and total timeouts for every API call the verifier makes.
+const HTTP_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HTTP_TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Largest API response body the verifier will buffer.
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+/// One client for all API legs: bounded time, and no redirects (a verifier must
+/// not be steered to a different host than the one it was pointed at).
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("build HTTP client")
+}
+
+/// Buffer a response body, refusing anything larger than [`MAX_BODY_BYTES`].
+async fn read_capped(mut resp: reqwest::Response) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = resp.chunk().await.context("read response body")? {
+        if body.len() + chunk.len() > MAX_BODY_BYTES {
+            bail!("response body exceeds {MAX_BODY_BYTES} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 async fn fetch_bundle(api_url: &str, alert_id: Uuid) -> Result<Receipt> {
     let url = format!(
         "{}/v1/audit/{}/replay-bundle",
         api_url.trim_end_matches('/'),
         alert_id
     );
-    let resp = reqwest::get(&url)
+    let resp = http_client()?
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {}", url))?;
     if !resp.status().is_success() {
         bail!("API returned {}: {}", resp.status(), url);
     }
-    let receipt: Receipt = resp.json().await.context("decode bundle JSON")?;
+    let receipt: Receipt =
+        serde_json::from_slice(&read_capped(resp).await?).context("decode bundle JSON")?;
     Ok(receipt)
 }
 
-fn verify(receipt: &Receipt, quiet: bool, json: bool) -> Result<()> {
+/// Bind the receipt's frozen configuration to what the receipt itself embeds
+/// (`assets_toml_canonical`) and to the methodology constants. The hash proves
+/// self-consistency only; without this a forged receipt could carry its own
+/// thresholds, class, alpha or confirm/decay windows and still re-derive.
+fn check_config_binding(receipt: &Receipt) -> std::result::Result<(), String> {
+    let inputs = &receipt.inputs_frozen;
+    let alpha: rust_decimal::Decimal = pegana_methodology::RECEIPT_EWMA_ALPHA
+        .parse()
+        .map_err(|_| "internal: bad alpha constant".to_string())?;
+    if inputs.alpha != alpha {
+        return Err(format!(
+            "alpha {} differs from the methodology value {alpha}",
+            inputs.alpha
+        ));
+    }
+    if inputs.confirm_up_secs != pegana_methodology::RECEIPT_CONFIRM_UP_SECS
+        || inputs.decay_down_secs != pegana_methodology::RECEIPT_DECAY_DOWN_SECS
+    {
+        return Err("confirm/decay windows differ from the methodology values".to_string());
+    }
+    let assets: toml::Value = toml::from_str(&receipt.assets_toml_canonical)
+        .map_err(|e| format!("embedded assets.toml does not parse: {e}"))?;
+    let entry = assets
+        .get("assets")
+        .and_then(|a| a.as_array())
+        .and_then(|list| {
+            list.iter()
+                .find(|a| a.get("symbol").and_then(|s| s.as_str()) == Some(inputs.asset.as_str()))
+        })
+        .ok_or_else(|| format!("asset {} is not in the embedded assets.toml", inputs.asset))?;
+    let class = serde_json::to_value(inputs.class).map_err(|e| e.to_string())?;
+    if entry.get("class").and_then(|c| c.as_str()) != class.as_str() {
+        return Err("asset class differs from the embedded assets.toml".to_string());
+    }
+    // The engine classifies hyUSD from its collateral ratio and everything else
+    // from the spread; a receipt cannot pick the other path.
+    let expected_kind =
+        if inputs.class == pegana_common_verify::AssetClass::StableCdp && inputs.asset == "hyUSD" {
+            "cr"
+        } else {
+            "bps"
+        };
+    if inputs.threshold_kind != expected_kind {
+        return Err(format!(
+            "threshold_kind {:?} differs from the expected {expected_kind:?} for {}",
+            inputs.threshold_kind, inputs.asset
+        ));
+    }
+    let key = match inputs.threshold_kind.as_str() {
+        "bps" => "thresholds_bps",
+        "cr" => "thresholds_cr",
+        other => return Err(format!("unknown threshold_kind {other:?}")),
+    };
+    let embedded: std::collections::HashMap<String, u32> = entry
+        .get(key)
+        .and_then(|t| t.as_table())
+        .map(|t| {
+            t.iter()
+                .filter_map(|(k, v)| {
+                    v.as_integer()
+                        .and_then(|n| u32::try_from(n).ok())
+                        .map(|n| (k.clone(), n))
+                })
+                .collect()
+        })
+        .ok_or_else(|| format!("embedded assets.toml has no {key} for {}", inputs.asset))?;
+    if embedded != inputs.thresholds {
+        return Err("thresholds differ from the embedded assets.toml".to_string());
+    }
+    Ok(())
+}
+
+fn verify(receipt: &Receipt, alert_id: Option<&Uuid>, quiet: bool, json: bool) -> Result<()> {
     // 1) Schema version — accept v1 (re-hash only) and v2 (re-hash + re-derive).
     // (Unsupported schema / hash-compute / re-derive-error bail out as Err →
     //  run() reports them as ERROR exit 2, in json or human form.)
@@ -576,7 +697,7 @@ fn verify(receipt: &Receipt, quiet: bool, json: bool) -> Result<()> {
         // this hint is the common path, not the edge case.
         eprintln!(
             "{}",
-            version_mismatch_hint(&receipt.methodology_version, cli_version)
+            version_mismatch_hint(&receipt.methodology_version, cli_version, alert_id)
         );
         std::process::exit(3);
     }
@@ -621,6 +742,14 @@ fn verify(receipt: &Receipt, quiet: bool, json: bool) -> Result<()> {
     //    frozen ewma_prev / candidate_* / previous_state values are incorrect
     //    post-mutation snapshots; re-derivation would produce spurious mismatches.
     let rederived_note = if receipt.schema_version == "v2" {
+        if let Err(reason) = check_config_binding(receipt) {
+            let message = format!("receipt config not bound to embedded assets.toml: {reason}");
+            if json {
+                emit_json_and_exit("fail", 1, Some(receipt), None, None, Some(&message));
+            }
+            eprintln!("{}  {message}", paint("FAIL", "31"));
+            std::process::exit(1);
+        }
         let computed = &receipt.expected_computed;
         let r = rederive(&receipt.inputs_frozen)
             .map_err(|e| anyhow!("re-derivation error (frozen inputs inconsistent): {e}"))?;
@@ -711,12 +840,17 @@ async fn verify_onchain(
         api_url.trim_end_matches('/'),
         alert_id
     );
-    let resp = reqwest::get(&url)
+    let resp = http_client()?
+        .get(&url)
+        .send()
         .await
         .with_context(|| format!("GET {}", url))?;
     if resp.status() == 404 {
         // Parse commit_status to decide whether silence is safe.
-        let body_404: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let body_404: serde_json::Value = match read_capped(resp).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+            Err(_) => serde_json::Value::Null,
+        };
         let status = body_404["commit_status"].as_str().unwrap_or("unknown");
         let final_state = receipt.expected_computed.final_state;
         if onchain_skip_is_ok(status, final_state) {
@@ -763,7 +897,7 @@ async fn verify_onchain(
     if !resp.status().is_success() {
         bail!("API returned {}", resp.status());
     }
-    let body: serde_json::Value = resp.json().await?;
+    let body: serde_json::Value = serde_json::from_slice(&read_capped(resp).await?)?;
     let tx_sig_str = body["tx_sig"].as_str().context("tx_sig missing")?;
 
     // 2) Parse the signature + connect to Solana RPC.
@@ -777,14 +911,23 @@ async fn verify_onchain(
 
     let sig = Signature::from_str(tx_sig_str)
         .with_context(|| format!("invalid Solana signature returned by API: {tx_sig_str}"))?;
-    let rpc = RpcClient::new_with_commitment(solana_rpc.to_string(), CommitmentConfig::confirmed());
+    let rpc = RpcClient::new_with_timeout_and_commitment(
+        solana_rpc.to_string(),
+        HTTP_TOTAL_TIMEOUT,
+        CommitmentConfig::confirmed(),
+    );
 
     // 3) Fetch the transaction. JsonParsed gives us decoded memo instruction data
     //    without us having to manually base58 decode + slice the program log line.
     let tx = rpc
         .get_transaction(&sig, UiTransactionEncoding::JsonParsed)
         .await
-        .with_context(|| format!("RPC get_transaction({tx_sig_str}) failed"))?;
+        .map_err(|e| {
+            anyhow!(
+                "RPC get_transaction({tx_sig_str}) failed: {}",
+                pegana_common_verify::redact_urls_in_error(e)
+            )
+        })?;
 
     // 4) Extract memo payload(s) from instructions. SPL Memo program embeds the
     //    UTF-8 payload as the instruction's `data` field when encoded as
@@ -972,6 +1115,7 @@ mod tests {
     use rust_decimal::Decimal;
     use std::collections::HashMap;
     use std::str::FromStr;
+    use uuid::Uuid;
 
     // ── helper: build a syntactically-valid receipt with a correct hash ──────
 
@@ -1002,6 +1146,9 @@ mod tests {
             confirm_up_secs: 30,
             decay_down_secs: 120,
             intrinsic_stale: false,
+            market_unavailable: false,
+            premium_unconfirmed: false,
+            premium_cap: None,
         }
     }
 
@@ -1015,7 +1162,7 @@ mod tests {
         }
     }
 
-    const STUB_TOML: &str = "[[assets]]\nsymbol = \"USDC\"\n";
+    const STUB_TOML: &str = "[[assets]]\nsymbol = \"USDC\"\nclass = \"stable_fiat\"\nthresholds_bps = { drift = 20, depeg = 100, critical = 300 }\n";
 
     fn make_receipt(schema_version: &str, inputs: InputsFrozen, computed: Computed) -> Receipt {
         let method_ver = methodology_version();
@@ -1039,6 +1186,108 @@ mod tests {
         }
     }
 
+    // ── HTTP hardening ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_client_does_not_follow_redirects() {
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/a"))
+            .respond_with(ResponseTemplate::new(302).insert_header("location", "/b"))
+            .mount(&server)
+            .await;
+        let resp = super::http_client()
+            .unwrap()
+            .get(format!("{}/a", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 302, "redirect must surface, not be followed");
+    }
+
+    #[tokio::test]
+    async fn oversized_bodies_are_refused() {
+        use wiremock::{matchers::path, Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(path("/big"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_bytes(vec![b'x'; super::MAX_BODY_BYTES + 1]),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(path("/small"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"{}".to_vec()))
+            .mount(&server)
+            .await;
+        let client = super::http_client().unwrap();
+        let big = client
+            .get(format!("{}/big", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert!(super::read_capped(big)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds"));
+        let small = client
+            .get(format!("{}/small", server.uri()))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(super::read_capped(small).await.unwrap(), b"{}");
+    }
+
+    // ── config binding (receipt config must match the embedded assets.toml) ──
+
+    fn bound_receipt() -> Receipt {
+        make_receipt("v2", stub_inputs(PegState::Pegged), stub_computed())
+    }
+
+    #[test]
+    fn config_binding_accepts_a_faithful_receipt() {
+        assert_eq!(super::check_config_binding(&bound_receipt()), Ok(()));
+    }
+
+    #[test]
+    fn config_binding_rejects_forged_thresholds_alpha_windows_and_class() {
+        let mut r = bound_receipt();
+        r.inputs_frozen.thresholds.insert("drift".into(), 5_000);
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("thresholds"));
+
+        let mut r = bound_receipt();
+        r.inputs_frozen.alpha = Decimal::ONE;
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("alpha"));
+
+        let mut r = bound_receipt();
+        r.inputs_frozen.confirm_up_secs = 0;
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("windows"));
+
+        let mut r = bound_receipt();
+        r.inputs_frozen.class = AssetClass::Lst;
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("class"));
+
+        let mut r = bound_receipt();
+        r.inputs_frozen.threshold_kind = "cr".into();
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("threshold_kind"));
+
+        let mut r = bound_receipt();
+        r.inputs_frozen.asset = "NOPE".into();
+        assert!(super::check_config_binding(&r)
+            .unwrap_err()
+            .contains("not in the embedded"));
+    }
+
     // ── v2 receipt: happy-path round-trip ────────────────────────────────────
 
     /// A v2 receipt with correct inputs and hash must verify (PASS).
@@ -1047,21 +1296,21 @@ mod tests {
         let receipt = make_receipt("v2", stub_inputs(PegState::Pegged), stub_computed());
         // verify() calls std::process::exit on failure, so this returning Ok is
         // proof the path succeeded.
-        assert!(verify(&receipt, true, false).is_ok());
+        assert!(verify(&receipt, None, true, false).is_ok());
     }
 
     /// A v1 receipt passes verify (re-hash only, no re-derive).
     #[test]
     fn v1_receipt_verify_pass_no_rederive() {
         let receipt = make_receipt("v1", stub_inputs(PegState::Pegged), stub_computed());
-        assert!(verify(&receipt, true, false).is_ok());
+        assert!(verify(&receipt, None, true, false).is_ok());
     }
 
     /// An unknown schema_version returns an error (not process::exit).
     #[test]
     fn unknown_schema_version_returns_err() {
         let receipt = make_receipt("v3", stub_inputs(PegState::Pegged), stub_computed());
-        let result = verify(&receipt, true, false);
+        let result = verify(&receipt, None, true, false);
         assert!(result.is_err(), "unknown schema_version must error");
         let msg = format!("{:?}", result.unwrap_err());
         assert!(
@@ -1349,7 +1598,7 @@ mod tests {
     #[test]
     fn hint_gives_an_exact_pin_for_every_known_historical_receipt() {
         for (methodology, cli) in CLI_BUILD_FOR_METHODOLOGY {
-            let hint = version_mismatch_hint(methodology, methodology_version());
+            let hint = version_mismatch_hint(methodology, methodology_version(), None);
             let expected = format!("cargo install pegana-replay@{cli} --locked");
             assert!(
                 hint.contains(&expected),
@@ -1366,7 +1615,7 @@ mod tests {
     #[test]
     fn hint_tells_a_stale_cli_to_update() {
         // Receipt newer than the build => the user is behind, not the receipt.
-        let hint = version_mismatch_hint("9.9.9", methodology_version());
+        let hint = version_mismatch_hint("9.9.9", methodology_version(), None);
         assert!(
             hint.contains("NEWER"),
             "must say the receipt is newer: {hint}"
@@ -1388,7 +1637,7 @@ mod tests {
         // verify-it-yourself path.
         let samples = ["0.4.0", "0.5.0", "0.6.0", "0.6.1", "9.9.9"];
         for receipt_ver in samples {
-            let hint = version_mismatch_hint(receipt_ver, methodology_version());
+            let hint = version_mismatch_hint(receipt_ver, methodology_version(), None);
             for line in hint.lines() {
                 let cmd = line.trim();
                 if cmd.starts_with("cargo install") {
@@ -1405,7 +1654,7 @@ mod tests {
     fn hint_is_honest_when_no_published_build_can_verify() {
         // methodology 0.3.0 predates the 2026-07-01 first publish: no artifact
         // exists. Claiming otherwise would send the user on a dead hunt.
-        let hint = version_mismatch_hint("0.3.0", methodology_version());
+        let hint = version_mismatch_hint("0.3.0", methodology_version(), None);
         assert!(
             hint.contains("No published build"),
             "must say plainly that nothing can verify it: {hint}"
@@ -1414,6 +1663,29 @@ mod tests {
             !hint.contains("cargo install"),
             "must not suggest an install that cannot work: {hint}"
         );
+    }
+
+    #[test]
+    fn pre_publish_hint_never_claims_an_anchor_and_links_the_receipt() {
+        // The fallback branch has no receipt data, so it cannot know whether an
+        // on-chain anchor exists (DRIFT receipts never have one). It must not
+        // assert one, and it must send the user to the page that can check the
+        // hash for THIS receipt.
+        let id = Uuid::parse_str("ac2f167f-daf8-46cc-ad5a-052c20a7eafb").unwrap();
+        let hint = version_mismatch_hint("0.3.0", methodology_version(), Some(&id));
+        assert!(
+            !hint.contains("anchor are still intact") && !hint.contains("anchor is intact"),
+            "must not claim an anchor it never checked: {hint}"
+        );
+        assert!(
+            hint.contains("https://www.pegana.xyz/audit/ac2f167f-daf8-46cc-ad5a-052c20a7eafb"),
+            "must link the receipt's own audit page: {hint}"
+        );
+
+        // --bundle mode has no alert id: fall back to the ledger, still no claim.
+        let hint = version_mismatch_hint("0.3.0", methodology_version(), None);
+        assert!(hint.contains("https://www.pegana.xyz/audit"), "{hint}");
+        assert!(!hint.contains("anchor are still intact"), "{hint}");
     }
 
     #[test]

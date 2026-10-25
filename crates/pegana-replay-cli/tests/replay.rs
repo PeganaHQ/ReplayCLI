@@ -52,6 +52,9 @@ fn synth_receipt_state(final_state: PegState) -> Receipt {
         confirm_up_secs: 30,
         decay_down_secs: 120,
         intrinsic_stale: false,
+        market_unavailable: false,
+        premium_unconfirmed: false,
+        premium_cap: None,
     };
     let computed = Computed {
         discount_raw: Decimal::from_str("0.01").unwrap(),

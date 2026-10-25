@@ -1,5 +1,38 @@
 # pegana-methodology changelog
 
+## 0.8.0 — 2026-10-24
+
+MINOR. Adds, all default-OFF at the engine and byte-exact for existing receipts:
+
+- `InputsFrozen.market_unavailable` + `OverrideReason::MarketUnavailable`: the
+  dark-market gate (ADR-0046). `false` is omitted from the canonical hash.
+  CR-classified assets are exempt (`market_unavailable_applies`). The override
+  functions gain a `market_unavailable: bool` parameter.
+- `InputsFrozen.premium_unconfirmed` + `confirm_premium_candidate` (ADR-0047):
+  applied to the candidate before the time hysteresis, an unconfirmed premium
+  caps a symmetric class at DRIFT and makes a direction-sensitive class keep a
+  committed DEPEG-or-worse band. `false` is
+  omitted from the hash; default OFF at the engine.
+- `RECEIPT_EWMA_ALPHA` / `RECEIPT_CONFIRM_UP_SECS` / `RECEIPT_DECAY_DOWN_SECS`:
+  the values the verifier binds receipts to. Changing them requires a bump.
+- `validate_thresholds`, `uses_sol_path`; `state_for_cr` now saturates a CR above
+  `u32::MAX` percent to the healthiest band instead of wrapping.
+
+Release order: every receipt the engine emits carries methodology 0.8.0 whatever
+the flags, so release a verifier embedding 0.8.0 (`pegana-replay` 0.6.0) before
+or together with the engine deploy.
+
+Version note: `intrinsic_stale` (ADR-0038) is also a hashed input that shipped in
+0.7.0 without a bump; a published 0.5.2 verifier cannot hash a receipt carrying
+`intrinsic_stale = true`. The bump to 0.8.0 makes it report VERSION_MISMATCH.
+
+Unflagged correctness fix (engine, not a methodology function): spread
+classification is now seeded from the FSM state the receipt freezes
+(`last_state`) instead of `last_published_state`. They are identical in normal
+operation; they differ only after a persistence failure or inside the BLACK_SWAN
+maturing carve-out, where the old seed made an honest receipt fail re-derivation
+(audit finding F07).
+
 ## 0.7.0 — 2026-07-16
 
 Behavior change (MINOR). Pyth confidence-gate —
@@ -101,7 +134,7 @@ Additive publish-time honesty guards; no existing band thresholds change.
   `pyth_spot`/`jupiter_usd`-numeraire market nor a `pyth_*` intrinsic) has no
   independent oracle cross-check, so it can no longer assert `high` confidence:
   the engine's `pyth_confidence_for_asset` caps it at `medium`. Blast radius
-  today is exactly **sUSD** (DexScreener ~$8k pool + custom rate); every other
+  today is exactly **sUSD** (DexScreener + custom rate); every other
   active asset has a Pyth dependency and is unchanged. Answers the validation
   grill "why does sUSD carry HIGH off a thin single source?". (Display-only —
   confidence is not a band threshold; no state-classification or calibration

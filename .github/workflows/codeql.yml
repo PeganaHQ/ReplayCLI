@@ -13,7 +13,7 @@
 #
 # Free for public repositories.
 #
-# NOTE: mirrored from tools/pegana-replay-public/ in the private repo.
+# NOTE: mirrored from tools/pegana-replay-public/ in PeganaHQ/Pegana.
 # Editing it here is pointless; the next sync overwrites it.
 name: CodeQL
 

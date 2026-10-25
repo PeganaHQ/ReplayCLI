@@ -38,8 +38,8 @@
 
 use crate::{
     apply_ewma_pure, classify_cr_with_hysteresis, classify_with_hysteresis, compute_discount,
-    is_plausible_discount_sample, override_final_state, receipt::InputsFrozen, transition_decide,
-    CR_DEADBAND_PCT, DEADBAND_PCT,
+    confirm_premium_candidate, is_plausible_discount_sample, market_unavailable_applies,
+    override_final_state, receipt::InputsFrozen, transition_decide, CR_DEADBAND_PCT, DEADBAND_PCT,
 };
 use pegana_common_verify::PegState;
 use rust_decimal::Decimal;
@@ -161,6 +161,17 @@ pub fn rederive(inputs: &InputsFrozen) -> Result<Rederived, MethodologyRederiveE
         )
     };
 
+    // Step 4b: premium-confirmation gate (ADR-0047) on the CANDIDATE, before the
+    // time hysteresis, so an unconfirmed premium never matures into a band.
+    let candidate = confirm_premium_candidate(
+        inputs.class,
+        discount_smooth,
+        inputs.previous_state,
+        inputs.premium_unconfirmed && market_unavailable_applies(&inputs.threshold_kind),
+        inputs.premium_cap,
+        candidate,
+    );
+
     // Step 5: time-hysteresis (transition_decide). Uses `inputs.previous_state`
     // as `current_last_state` — same field that seeds classify above.
     // `candidate_state`/`candidate_since` are the frozen pre-transition values
@@ -189,6 +200,7 @@ pub fn rederive(inputs: &InputsFrozen) -> Result<Rederived, MethodologyRederiveE
         discount_smooth,
         &inputs.pyth_entries,
         inputs.intrinsic_stale,
+        inputs.market_unavailable && market_unavailable_applies(&inputs.threshold_kind),
         final_state,
     );
 
@@ -251,6 +263,9 @@ mod tests {
             confirm_up_secs: 30,
             decay_down_secs: 120,
             intrinsic_stale: false,
+            market_unavailable: false,
+            premium_unconfirmed: false,
+            premium_cap: None,
         }
     }
 
@@ -281,6 +296,56 @@ mod tests {
             PegState::Unknown,
             "a stale backing must force UNKNOWN"
         );
+    }
+
+    // Market-unavailable gate: a frozen dark market leg forces UNKNOWN, so the
+    // engine's dark-market receipt re-derives to the published state.
+    #[test]
+    fn market_unavailable_receipt_rederives_to_unknown() {
+        let mut inputs = base_inputs(AssetClass::StableFiat, "bps");
+        assert_eq!(rederive(&inputs).unwrap().final_state, PegState::Pegged);
+        inputs.market_unavailable = true;
+        assert_eq!(rederive(&inputs).unwrap().final_state, PegState::Unknown);
+    }
+
+    // A CR-classified asset (hyUSD) is exempt: its state comes from the on-chain
+    // CR, so a dark market leg must not force UNKNOWN (and the receipt agrees).
+    #[test]
+    fn market_unavailable_does_not_apply_to_cr_assets() {
+        let mut inputs = base_inputs(AssetClass::StableCdp, "cr");
+        inputs.hyusd_cr = Some(Decimal::from_str("2.0").unwrap());
+        let healthy = rederive(&inputs).unwrap().final_state;
+        inputs.market_unavailable = true;
+        assert_eq!(rederive(&inputs).unwrap().final_state, healthy);
+    }
+
+    // A confirmed BLACK_SWAN yields to the dark-market gate (ADR-0039).
+    #[test]
+    fn market_unavailable_yields_to_a_confirmed_black_swan() {
+        let mut inputs = base_inputs(AssetClass::StableFiat, "bps");
+        inputs.market_usd = Decimal::from_str("0.40").unwrap();
+        inputs.previous_state = PegState::BlackSwan;
+        inputs.market_unavailable = true;
+        assert_eq!(rederive(&inputs).unwrap().final_state, PegState::BlackSwan);
+    }
+
+    // F07: classification is seeded from the FSM state the receipt freezes
+    // (`previous_state`). A committed DEPEG with a matured DRIFT relaxation
+    // candidate and a smoothed discount inside the sticky deadband (75–100 bps)
+    // must stay DEPEG on BOTH the engine (now seeded from `last_state`) and here.
+    #[test]
+    fn classification_is_seeded_from_the_frozen_fsm_state() {
+        let mut inputs = base_inputs(AssetClass::StableFiat, "bps");
+        inputs.previous_state = PegState::Depeg;
+        inputs.candidate_state = Some(PegState::Drift);
+        inputs.candidate_since = Some(fixed_now() - Duration::seconds(3_600));
+        inputs.market_usd = Decimal::from_str("0.9915").unwrap(); // 85 bps
+        assert_eq!(rederive(&inputs).unwrap().final_state, PegState::Depeg);
+        // The same discount from a PEGGED seed is DRIFT: the seed decides.
+        inputs.previous_state = PegState::Pegged;
+        inputs.candidate_state = None;
+        inputs.candidate_since = None;
+        assert_ne!(rederive(&inputs).unwrap().final_state, PegState::Depeg);
     }
 
     // Provably inert when false: the gate never changes a verdict for the

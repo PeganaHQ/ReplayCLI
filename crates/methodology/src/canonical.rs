@@ -89,6 +89,9 @@ mod tests {
             confirm_up_secs: 30,
             decay_down_secs: 120,
             intrinsic_stale: false,
+            market_unavailable: false,
+            premium_unconfirmed: false,
+            premium_cap: None,
         }
     }
 
@@ -108,6 +111,36 @@ mod tests {
         assert_eq!(
             canonical_assets_hash(with_comment).unwrap(),
             canonical_assets_hash(without).unwrap()
+        );
+    }
+
+    // And for `premium_unconfirmed` (ADR-0047): false is omitted, true is hashed.
+    #[test]
+    fn premium_unconfirmed_false_is_omitted_from_canonical_hash() {
+        let plain = sample_inputs();
+        let jcs_false = serde_json_canonicalizer::to_string(&plain).unwrap();
+        assert!(!jcs_false.contains("premium_unconfirmed"), "{jcs_false}");
+        let mut flagged = sample_inputs();
+        flagged.premium_unconfirmed = true;
+        let jcs_true = serde_json_canonicalizer::to_string(&flagged).unwrap();
+        assert!(
+            jcs_true.contains("\"premium_unconfirmed\":true"),
+            "{jcs_true}"
+        );
+    }
+
+    // Same byte-exactness invariant for `market_unavailable`: false is omitted so
+    // every receipt written before the field existed hashes identically.
+    #[test]
+    fn market_unavailable_false_is_omitted_from_canonical_hash() {
+        let jcs_false = serde_json_canonicalizer::to_string(&sample_inputs()).unwrap();
+        assert!(!jcs_false.contains("market_unavailable"), "{jcs_false}");
+        let mut dark = sample_inputs();
+        dark.market_unavailable = true;
+        let jcs_true = serde_json_canonicalizer::to_string(&dark).unwrap();
+        assert!(
+            jcs_true.contains("\"market_unavailable\":true"),
+            "{jcs_true}"
         );
     }
 
@@ -324,6 +357,9 @@ mod tests {
                 confirm_up_secs: 30,
                 decay_down_secs: 120,
                 intrinsic_stale: false,
+                market_unavailable: false,
+                premium_unconfirmed: false,
+                premium_cap: None,
             };
             let computed = crate::receipt::Computed {
                 discount_raw:    Decimal::new(intrinsic_int - market_int, 4),

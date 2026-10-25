@@ -243,6 +243,82 @@ pub enum OverrideReason {
     PythConfidence,
     /// The intrinsic backing is flagged stale (ADR-0038; gate opt-in).
     IntrinsicLiveness,
+    /// The market source reported consecutive missing quotes; the frozen market
+    /// leg is a stale last-known value.
+    MarketUnavailable,
+}
+
+/// The drift band (bps) of a spread threshold table, after aliases and defaults:
+/// the size above which a market premium needs a second source to be believed.
+pub fn premium_confirmation_floor_bps(thresholds: &HashMap<String, u32>) -> u32 {
+    resolved_bps_bands(thresholds).drift
+}
+
+/// The depeg band (bps) of a spread threshold table, after aliases and defaults.
+pub fn depeg_band_bps(thresholds: &HashMap<String, u32>) -> u32 {
+    resolved_bps_bands(thresholds).depeg
+}
+
+/// How closely (bps) an independent reference must match the smoothed discount to
+/// CONFIRM a premium: half the drift band, capped at 10 bps. A tolerance as wide as
+/// the reference-rejection bound would "confirm" premiums larger than the DEPEG band.
+pub fn premium_confirmation_tolerance_bps(thresholds: &HashMap<String, u32>) -> u32 {
+    (resolved_bps_bands(thresholds).drift / 2).clamp(1, 10)
+}
+
+/// Apply the premium-confirmation gate (ADR-0047) to the raw CANDIDATE, before
+/// the time hysteresis, so an unconfirmed premium never enters the state machine
+/// at all (a published-state clamp would leave the internal FSM escalating and
+/// only delay the false band).
+///
+/// With `premium_unconfirmed` set on a genuine premium (`discount_smooth < 0`):
+/// - a symmetric class (premium = depeg: stable_fiat, cdp, dn, fx, ...) has its
+///   candidate capped at DRIFT when no second source confirms the premium (or
+///   at `premium_cap`, the band the reference implies);
+/// - a direction-sensitive class (lst, stable_yield; a premium normally reads
+///   PEGGED) keeps `candidate >= previous_state` while a DEPEG-or-worse band is
+///   committed, so an unconfirmed bid cannot start a relaxation.
+///
+/// The live engine, `rederive` and the backtest runner all call this one
+/// function, so they agree by construction.
+pub fn confirm_premium_candidate(
+    class: AssetClass,
+    discount_smooth: Decimal,
+    previous_state: PegState,
+    premium_unconfirmed: bool,
+    premium_cap: Option<PegState>,
+    candidate: PegState,
+) -> PegState {
+    if !premium_unconfirmed || discount_smooth >= Decimal::ZERO {
+        return candidate;
+    }
+    if is_direction_sensitive(class) {
+        if rank(previous_state) >= rank(PegState::Depeg) && rank(candidate) < rank(previous_state) {
+            return previous_state;
+        }
+        return candidate;
+    }
+    // Symmetric: capped at DRIFT, or at the band the independent reference itself
+    // implies when that is worse (a real premium depeg with a small basis between
+    // the venues must not be stuck at DRIFT).
+    let ceiling = match premium_cap {
+        Some(cap) if rank(cap) > rank(PegState::Drift) => cap,
+        _ => PegState::Drift,
+    };
+    if rank(candidate) > rank(ceiling) {
+        return ceiling;
+    }
+    candidate
+}
+
+/// Whether a dark market leg forces UNKNOWN for an asset classified with
+/// `threshold_kind`. A collateral-ratio asset (hyUSD) is classified from its
+/// on-chain CR, not from the market leg, so a missing market quote says nothing
+/// about its state and it is exempt. Callers pass
+/// `market_unavailable && market_unavailable_applies(kind)` to the override,
+/// and freeze that same value in the receipt, so `rederive` agrees.
+pub fn market_unavailable_applies(threshold_kind: &str) -> bool {
+    threshold_kind != "cr"
 }
 
 /// The honest-dark UNKNOWN override + confirmed-BLACK_SWAN carve-out, returning
@@ -277,12 +353,18 @@ pub fn override_final_state_attributed(
     discount_smooth: Decimal,
     pyth_entries: &HashMap<String, PythEntry>,
     intrinsic_stale: bool,
+    market_unavailable: bool,
     final_state: PegState,
 ) -> (PegState, Option<OverrideReason>) {
     // A confirmed BLACK_SWAN is exempt from ALL FOUR gates (see doc). Premium-sanity
     // has no maturation nuance: a premium classifies to PEGGED, so it is never a
     // BlackSwan *candidate* — the guard only protects an already-committed BlackSwan.
     if final_state != PegState::BlackSwan {
+        // Checked first: with a stale market leg the discount-derived gates below
+        // would be attributing a last-known price.
+        if market_unavailable {
+            return (PegState::Unknown, Some(OverrideReason::MarketUnavailable));
+        }
         if premium_sanity_violated(class, discount_smooth) {
             return (PegState::Unknown, Some(OverrideReason::PremiumSanity));
         }
@@ -307,6 +389,7 @@ pub fn override_final_state(
     discount_smooth: Decimal,
     pyth_entries: &HashMap<String, PythEntry>,
     intrinsic_stale: bool,
+    market_unavailable: bool,
     final_state: PegState,
 ) -> PegState {
     override_final_state_attributed(
@@ -314,6 +397,7 @@ pub fn override_final_state(
         discount_smooth,
         pyth_entries,
         intrinsic_stale,
+        market_unavailable,
         final_state,
     )
     .0
@@ -428,6 +512,53 @@ pub fn classify_cr_with_hysteresis(
     state_for_cr(cr, &exit_thresholds)
 }
 
+/// The four resolved band edges of a threshold table, after key aliases and
+/// defaults. The classifiers and [`validate_thresholds`] both resolve through
+/// here, so validation judges exactly what classification will use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Bands {
+    drift: u32,
+    depeg: u32,
+    critical: u32,
+    black_swan: u32,
+    /// `black_swan` was not configured and defaulted from `critical`.
+    black_swan_implied: bool,
+}
+
+fn band(t: &HashMap<String, u32>, name: &str, alias: &str, default: u32) -> u32 {
+    t.get(name)
+        .or_else(|| t.get(alias))
+        .copied()
+        .unwrap_or(default)
+}
+
+/// Spread bands (bps): defaults 20/100/300, black_swan = 2 x critical.
+fn resolved_bps_bands(t: &HashMap<String, u32>) -> Bands {
+    let critical = band(t, "critical", "critical_bps", 300);
+    let configured = t
+        .get("black_swan")
+        .or_else(|| t.get("black_swan_bps"))
+        .copied();
+    Bands {
+        drift: band(t, "drift", "drift_bps", 20),
+        depeg: band(t, "depeg", "depeg_bps", 100),
+        critical,
+        black_swan: configured.unwrap_or_else(|| critical.saturating_mul(2)),
+        black_swan_implied: configured.is_none(),
+    }
+}
+
+/// Collateral-ratio bands (percent): defaults 150/130/110/100.
+fn resolved_cr_bands(t: &HashMap<String, u32>) -> Bands {
+    Bands {
+        drift: band(t, "drift", "cr_drift", 150),
+        depeg: band(t, "depeg", "cr_depeg", 130),
+        critical: band(t, "critical", "cr_critical", 110),
+        black_swan: band(t, "black_swan", "cr_black_swan", 100),
+        black_swan_implied: false,
+    }
+}
+
 /// Convert smoothed discount → state using BPS thresholds.
 /// `discount` is `1 - market/intrinsic`. |discount| is what matters for
 /// symmetric classes (LST, fiat, dn, fx, synth_lev). For yield-bearing
@@ -462,37 +593,13 @@ pub fn state_for_bps_discount(discount: Decimal, thresholds: &HashMap<String, u3
     // (DB seed JSONB: `"drift_bps": 20`) keys. assets.toml is the canonical
     // source loaded at engine boot; the suffixed fallback exists so a future
     // change to read thresholds straight from the DB row would still work.
-    let drift = thresholds
-        .get("drift")
-        .or_else(|| thresholds.get("drift_bps"))
-        .copied()
-        .unwrap_or(20);
-    let depeg = thresholds
-        .get("depeg")
-        .or_else(|| thresholds.get("depeg_bps"))
-        .copied()
-        .unwrap_or(100);
-    let critical = thresholds
-        .get("critical")
-        .or_else(|| thresholds.get("critical_bps"))
-        .copied()
-        .unwrap_or(300);
-    // BLACK_SWAN on the spread path (methodology 0.4.0). A discount beyond any
-    // normal band — default = 2× critical, overridable via `black_swan` /
-    // `black_swan_bps`. This makes the publicly-advertised 5th state reachable
-    // from spread (a USDC 4%+ break, a UST-style CRITICAL→BLACK_SWAN cascade),
-    // not only from the CR path (hyUSD) — closing the validation "Four/Five
-    // states" honesty gap. It re-labels only the most extreme moves (already
-    // CRITICAL today); nothing at or below critical changes. NOTE: it auto-exits
-    // via the normal hysteresis like every other band — the engine does NOT
-    // enforce the "never auto-exits / operator-reset" terminal behaviour the
-    // marketing copy used to imply (there is no reset path to make that safe);
-    // see ADR-0025. The CR-path black_swan (hyUSD) already behaved this way.
-    let black_swan = thresholds
-        .get("black_swan")
-        .or_else(|| thresholds.get("black_swan_bps"))
-        .copied()
-        .unwrap_or_else(|| critical.saturating_mul(2));
+    let Bands {
+        drift,
+        depeg,
+        critical,
+        black_swan,
+        ..
+    } = resolved_bps_bands(thresholds);
 
     match abs_bps {
         n if n >= black_swan => PegState::BlackSwan,
@@ -503,31 +610,95 @@ pub fn state_for_bps_discount(discount: Decimal, thresholds: &HashMap<String, u3
     }
 }
 
+/// Largest spread (bps) the discount path can ever express: `|discount| < 1`.
+const MAX_REACHABLE_BPS: u32 = 9_999;
+
+/// Check a per-asset threshold table at load time. Returns advisory warnings, or
+/// the first violation as an error.
+///
+/// `kind` is `"bps"` (spread path: drift < depeg < critical < black_swan) or
+/// `"cr"` (collateral-ratio path: drift > depeg > critical > black_swan).
+/// Unknown keys are rejected so a typo (`depeg_bp`) cannot silently fall back to
+/// a default band. An explicit bps `black_swan` above 9,999 is an error; an
+/// IMPLIED one (2 × critical) above it is a warning, because the fifth state is
+/// then unreachable for that asset.
+pub fn validate_thresholds(
+    kind: &str,
+    thresholds: &HashMap<String, u32>,
+) -> Result<Vec<String>, String> {
+    let names = ["drift", "depeg", "critical", "black_swan"];
+    let prefixed = |n: &str| match kind {
+        "bps" => format!("{n}_bps"),
+        _ => format!("cr_{n}"),
+    };
+    if kind != "bps" && kind != "cr" {
+        return Err(format!("unknown threshold kind {kind:?}"));
+    }
+    for key in thresholds.keys() {
+        if !names.iter().any(|n| key == n || *key == prefixed(n)) {
+            return Err(format!("unknown threshold key {key:?}"));
+        }
+    }
+    for n in names {
+        if thresholds.contains_key(n) && thresholds.contains_key(&prefixed(n)) {
+            return Err(format!("{n} is set under both {n:?} and {:?}", prefixed(n)));
+        }
+    }
+    if thresholds.values().any(|v| *v == 0) {
+        return Err("a threshold of 0 is not allowed".to_string());
+    }
+    // Judge the RESOLVED bands (aliases + defaults), exactly as classification
+    // will use them, so a partial table cannot hide a mis-ordering.
+    let bands = if kind == "bps" {
+        resolved_bps_bands(thresholds)
+    } else {
+        resolved_cr_bands(thresholds)
+    };
+    let edges = [
+        ("drift", bands.drift),
+        ("depeg", bands.depeg),
+        ("critical", bands.critical),
+        ("black_swan", bands.black_swan),
+    ];
+    for pair in edges.windows(2) {
+        let ((lo_name, lo), (hi_name, hi)) = (pair[0], pair[1]);
+        let ordered = if kind == "bps" { hi > lo } else { hi < lo };
+        if !ordered {
+            return Err(format!(
+                "{hi_name} ({hi}) must be {} {lo_name} ({lo})",
+                if kind == "bps" { "above" } else { "below" }
+            ));
+        }
+    }
+    let mut warnings = Vec::new();
+    if kind == "bps" && bands.black_swan > MAX_REACHABLE_BPS {
+        if bands.black_swan_implied {
+            warnings.push(format!(
+                "implied black_swan (2 x critical = {} bps) is unreachable; set black_swan explicitly",
+                bands.black_swan
+            ));
+        } else {
+            return Err(format!(
+                "black_swan ({} bps) is unreachable: |discount| < 1 caps the spread at {MAX_REACHABLE_BPS} bps",
+                bands.black_swan
+            ));
+        }
+    }
+    Ok(warnings)
+}
+
 /// CR-based state for hyUSD-style CDP stables. Thresholds in percentage
 /// points (e.g. 150 = 150%).
 pub fn state_for_cr(cr: Decimal, thresholds: &HashMap<String, u32>) -> PegState {
     // Same dual-key tolerance as the bps function. assets.toml uses
     // `drift = 150` (no prefix); the DB JSONB uses `cr_drift`.
-    let drift = thresholds
-        .get("drift")
-        .or_else(|| thresholds.get("cr_drift"))
-        .copied()
-        .unwrap_or(150);
-    let depeg = thresholds
-        .get("depeg")
-        .or_else(|| thresholds.get("cr_depeg"))
-        .copied()
-        .unwrap_or(130);
-    let critical = thresholds
-        .get("critical")
-        .or_else(|| thresholds.get("cr_critical"))
-        .copied()
-        .unwrap_or(110);
-    let black_swan = thresholds
-        .get("black_swan")
-        .or_else(|| thresholds.get("cr_black_swan"))
-        .copied()
-        .unwrap_or(100);
+    let Bands {
+        drift,
+        depeg,
+        critical,
+        black_swan,
+        ..
+    } = resolved_cr_bands(thresholds);
 
     // Convert CR to integer percent. `checked_mul` guards a `cr` magnitude
     // large enough to overflow Decimal (rust_decimal's `*` PANICS on
@@ -544,7 +715,7 @@ pub fn state_for_cr(cr: Decimal, thresholds: &HashMap<String, u32>) -> PegState 
                 .next()
                 .and_then(|s| s.parse::<i64>().ok())
         })
-        .map(|n| n.max(0) as u32)
+        .map(|n| u32::try_from(n.max(0)).unwrap_or(u32::MAX))
         .unwrap_or(u32::MAX);
 
     match cr_pct {
@@ -1173,12 +1344,26 @@ mod tests {
         let d = |s: &str| Decimal::from_str(s).unwrap();
         // premium beyond bound (negative discount) → PremiumSanity.
         assert_eq!(
-            override_final_state_attributed(c, d("-0.9"), &HashMap::new(), false, PegState::Pegged),
+            override_final_state_attributed(
+                c,
+                d("-0.9"),
+                &HashMap::new(),
+                false,
+                false,
+                PegState::Pegged
+            ),
             (PegState::Unknown, Some(OverrideReason::PremiumSanity)),
         );
         // discount beyond bound → DiscountSanity (state not BlackSwan).
         assert_eq!(
-            override_final_state_attributed(c, d("0.9"), &HashMap::new(), false, PegState::Depeg),
+            override_final_state_attributed(
+                c,
+                d("0.9"),
+                &HashMap::new(),
+                false,
+                false,
+                PegState::Depeg
+            ),
             (PegState::Unknown, Some(OverrideReason::DiscountSanity)),
         );
         // wide Pyth, benign discount → PythConfidence.
@@ -1187,6 +1372,7 @@ mod tests {
                 c,
                 Decimal::ZERO,
                 &wide_conf(),
+                false,
                 false,
                 PegState::Pegged
             ),
@@ -1199,6 +1385,7 @@ mod tests {
                 Decimal::ZERO,
                 &HashMap::new(),
                 true,
+                false,
                 PegState::Pegged
             ),
             (PegState::Unknown, Some(OverrideReason::IntrinsicLiveness)),
@@ -1209,6 +1396,7 @@ mod tests {
                 c,
                 Decimal::ZERO,
                 &HashMap::new(),
+                false,
                 false,
                 PegState::Drift
             ),
@@ -1226,6 +1414,7 @@ mod tests {
                 Decimal::from_str("0.9").unwrap(),
                 &wide_conf(),
                 true,
+                false,
                 PegState::Depeg,
             )
             .1,
@@ -1233,8 +1422,15 @@ mod tests {
         );
         // pyth + intrinsic fire → pyth wins.
         assert_eq!(
-            override_final_state_attributed(c, Decimal::ZERO, &wide_conf(), true, PegState::Pegged)
-                .1,
+            override_final_state_attributed(
+                c,
+                Decimal::ZERO,
+                &wide_conf(),
+                true,
+                false,
+                PegState::Pegged
+            )
+            .1,
             Some(OverrideReason::PythConfidence),
         );
     }
@@ -1251,6 +1447,7 @@ mod tests {
                 Decimal::from_str("0.9").unwrap(),
                 &wide_conf(),
                 true,
+                false,
                 PegState::BlackSwan,
             ),
             (PegState::BlackSwan, None),
@@ -1264,6 +1461,7 @@ mod tests {
                 Decimal::from_str("-0.9").unwrap(),
                 &HashMap::new(),
                 false,
+                false,
                 PegState::BlackSwan,
             ),
             (PegState::BlackSwan, None),
@@ -1275,9 +1473,119 @@ mod tests {
                 Decimal::from_str("-0.9").unwrap(),
                 &HashMap::new(),
                 false,
+                false,
                 PegState::Pegged,
             ),
             (PegState::Unknown, Some(OverrideReason::PremiumSanity)),
+        );
+    }
+
+    #[test]
+    fn cr_percentage_above_u32_saturates_to_the_healthiest_band() {
+        // 50,000,000 → 5e9 percent: above u32::MAX; previously wrapped modulo 2^32.
+        let t: HashMap<String, u32> = [
+            ("drift", 150),
+            ("depeg", 130),
+            ("critical", 110),
+            ("black_swan", 100),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect();
+        assert_eq!(
+            state_for_cr(Decimal::from(50_000_000u32), &t),
+            PegState::Pegged
+        );
+    }
+
+    #[test]
+    fn threshold_validation_rejects_typos_misordering_and_unreachable_black_swan() {
+        let map = |pairs: &[(&str, u32)]| -> HashMap<String, u32> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        assert_eq!(
+            validate_thresholds(
+                "bps",
+                &map(&[("drift", 20), ("depeg", 100), ("critical", 300)])
+            ),
+            Ok(vec![])
+        );
+        assert!(validate_thresholds("bps", &map(&[("drift", 20), ("depeg_bp", 100)])).is_err());
+        assert!(validate_thresholds("bps", &map(&[("drift", 100), ("depeg", 50)])).is_err());
+        assert!(
+            validate_thresholds("bps", &map(&[("critical", 300), ("black_swan", 20_000)])).is_err()
+        );
+        let warn = validate_thresholds(
+            "bps",
+            &map(&[("drift", 1500), ("depeg", 3000), ("critical", 6000)]),
+        )
+        .unwrap();
+        assert_eq!(warn.len(), 1, "implied black_swan 12000 bps is unreachable");
+        assert!(validate_thresholds(
+            "cr",
+            &map(&[
+                ("drift", 150),
+                ("depeg", 130),
+                ("critical", 110),
+                ("black_swan", 100)
+            ])
+        )
+        .is_ok());
+        assert!(validate_thresholds("cr", &map(&[("drift", 150), ("depeg", 160)])).is_err());
+    }
+
+    #[test]
+    fn validation_judges_resolved_bands_and_rejects_zero_and_duplicates() {
+        let map = |pairs: &[(&str, u32)]| -> HashMap<String, u32> {
+            pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect()
+        };
+        // Partial table: drift above the DEFAULT depeg (100) is a mis-ordering.
+        assert!(validate_thresholds("bps", &map(&[("drift", 500)])).is_err());
+        // Critical below the default depeg.
+        assert!(validate_thresholds("bps", &map(&[("critical", 50)])).is_err());
+        assert!(validate_thresholds("bps", &map(&[("drift", 0)])).is_err());
+        assert!(validate_thresholds("bps", &map(&[("drift", 20), ("drift_bps", 20)])).is_err());
+        assert!(validate_thresholds("bps", &map(&[("drift_bps", 20), ("depeg_bps", 100)])).is_ok());
+    }
+
+    #[test]
+    fn market_unavailable_forces_unknown_first_and_yields_to_black_swan() {
+        let c = AssetClass::Lst;
+        assert_eq!(
+            override_final_state_attributed(
+                c,
+                Decimal::ZERO,
+                &HashMap::new(),
+                false,
+                true,
+                PegState::Pegged
+            ),
+            (PegState::Unknown, Some(OverrideReason::MarketUnavailable)),
+        );
+        // Attribution precedes the discount-derived gates (stale values must not
+        // be reported as a premium/discount-sanity failure).
+        assert_eq!(
+            override_final_state_attributed(
+                c,
+                Decimal::from_str("-0.9").unwrap(),
+                &HashMap::new(),
+                false,
+                true,
+                PegState::Pegged
+            )
+            .1,
+            Some(OverrideReason::MarketUnavailable),
+        );
+        assert_eq!(
+            override_final_state_attributed(
+                c,
+                Decimal::ZERO,
+                &HashMap::new(),
+                false,
+                true,
+                PegState::BlackSwan
+            ),
+            (PegState::BlackSwan, None),
         );
     }
 
@@ -1295,8 +1603,8 @@ mod tests {
         ];
         for (disc, pyth, stale, fs) in cases {
             assert_eq!(
-                override_final_state(c, disc, &pyth, stale, fs),
-                override_final_state_attributed(c, disc, &pyth, stale, fs).0,
+                override_final_state(c, disc, &pyth, stale, false, fs),
+                override_final_state_attributed(c, disc, &pyth, stale, false, fs).0,
                 "the state-only wrapper must equal the attributed state",
             );
         }

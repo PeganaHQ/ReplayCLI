@@ -249,11 +249,13 @@ intrinsic      = { kind = "sanctum_lst", symbol = "hyloSOL+" }
 market         = { kind = "jupiter_usd", numeraire = "SOL", numeraire_feed = "SOL/USD" }
 pyth_feed_id   = ""
 thresholds_bps = { drift = 30, depeg = 120, critical = 350 }
-# monitoring-only per migration 0049 on 2026-06-14 — FROZEN single-source signal:
-# discount pinned to one distinct value over the window while market moves (the
-# Sanctum sol_per_lst intrinsic is not advancing). Cannot detect real stress, so
-# contained (excluded from public egress) pending genuine price discovery. The
-# engine freeze-detector is the systemic fix. See validation handoff 2026-06-14.
+# History: contained (monitoring-only) by migration 0049 on 2026-06-14 for a
+# frozen single-source signal; promoted to calibrated by migration 0069 (owner
+# override, ADR-0015 D6, 2026-07-23), so it alerts publicly today.
+# Known noise (2026-10 review): the current drift threshold overlaps ordinary
+# market variability, so short-lived DRIFT transitions have occurred. hyloSOL
+# (same issuer) uses a different threshold from its calibration data. Retuning is a
+# calibration decision for the owner (it changes the assets hash in receipts).
 
 [[assets]]
 symbol         = "sHYUSD"
@@ -341,43 +343,43 @@ active         = false
 symbol         = "USDY"
 name           = "Ondo US Dollar Yield"
 mint           = "A1KLoBrKBde8Ty9qtNQUtq3C2ortoC3u7twggz7sEto6"
-verified       = true    # mint confirmed via Jupiter + mainnet RPC; NAV source = Pyth USDY/USD.RR
+verified       = true    # mint confirmed via Jupiter + mainnet RPC; NAV source = Ondo RWADynamicOracle on Ethereum (eth_call)
 decimals       = 6
 token_program  = "spl"
 class          = "stable_yield"
 peg_target     = "USD"
-# Task 4 resolution: Ondo publishes the official USDY redemption rate (their
-# NAV oracle) to Pyth as the dedicated `Crypto.USDY/USD.RR` feed. The feed
-# carries `contract_id: eth:0x96f6ef951840721adbf46ac996b59e0235cb985c` in
-# its Pyth attributes — Ondo's Ethereum redemption-price contract — which
-# confirms the feed is issuer-attested rather than market-priced. No separate
-# Solana on-chain oracle account is published, but the Pyth RR feed is
-# cross-chain and equally authoritative. Indexer's `pyth.rs` source treats
-# any `pyth_redemption_rate` asset's feed as an `intrinsic_snapshots`
-# writer — no per-issuer Rust adapter needed.
-intrinsic      = { kind = "pyth_redemption_rate", feed = "USDY/USD.RR" }
-market         = { kind = "pyth_spot", feed = "USDY/USD" }   # Pyth spot price (secondary market). Engine compares vs NAV above.
-pyth_feed_id   = "0xe393449f6aff8a4b6d3e1165a7c9ebec103685f3b41e60db4277b5b6d10e7326"
+# Intrinsic (2026-10-21): Ondo's own USDY price oracle on Ethereum, the
+# RWADynamicOracle `getPrice()` (selector 0x98d5fdca, 18 decimals, USD per
+# USDY; ~1.1505 on 2026-10-21). This replaces the Pyth `USDY/USD.RR` feed,
+# which is not available on Solana without paid Hermes. Read by the indexer
+# `evm_nav` source via plain `eth_call` against public Ethereum RPCs, pinned
+# to a block no older than 180s, and published only when at least 2 of the
+# 3 default RPCs agree within 10 bps. Independent of the market leg (a Solana secondary-market
+# price), which never touches Ondo's mint/redeem.
+intrinsic      = { kind = "evm_view_nav", contract = "0xA0219AA5B31e65Bc920B5b6DFb8EdF0988121De0", calldata = "0x98d5fdca", decimals = 18, max_divergence_bps = 10, max_block_age_secs = 180 }
+market         = { kind = "jupiter_usd", numeraire = "USDC", numeraire_feed = "USDC/USD" }   # 2026-10-22: Pyth USDY/USD spot steps ~once a day on-chain; Jupiter provides the market quote. Migration 0081.
+pyth_feed_id   = ""   # cleared 2026-10-22: the ~daily-stepping USDY/USD print is no live cross-check (USDu precedent)
 thresholds_bps = { drift = 30, depeg = 100, critical = 250 }
 
 [[assets]]
 symbol         = "sUSDe"
 name           = "Ethena Staked USDe"
 mint           = "Eh6XEPhSwoLv5wFApukmnaVSHQ6sAnoD9BmgmwQoN2sN"
-verified       = true    # mint confirmed via docs.ethena.fi + mainnet RPC; NAV source = Pyth SUSDE/USDE.RR
+verified       = true    # mint confirmed via docs.ethena.fi + mainnet RPC; NAV source = sUSDe ERC-4626 on Ethereum (eth_call)
 decimals       = 9       # 9 on Solana (Wormhole NTT bridged variant, matches USDe Solana pattern)
 token_program  = "spl"
 class          = "stable_yield"
 peg_target     = "USD"
-# Task 9 resolution: Ethena publishes the official sUSDe redemption rate
-# (per-share NAV vs USDE) to Pyth as `Crypto.SUSDE/USDE.RR`. The feed is
-# Ethena-attested on Ethereum — Hermes redistributes it cross-chain, so
-# consuming it from Solana is equivalent to reading the source.
-# Note: feed is USDE-quoted, not USD-quoted. USDE is Ethena's delta-neutral
-# stablecoin that trades within ~1bp of $1; engine treats value as USD-denominated.
-# Drift threshold (30bps) absorbs USDE/USD slippage comfortably.
-# Same code path as USDY (Task 4) and syrupUSDC (Task 7) — no new adapter.
-intrinsic      = { kind = "pyth_redemption_rate", feed = "SUSDE/USDE.RR" }
+# Intrinsic (2026-10-21): the sUSDe ERC-4626 vault on Ethereum,
+# `convertToAssets(1e18)` (selector 0x07a2d13a, 18 decimals; ~1.2542 USDe per
+# sUSDe on 2026-10-21). This is the exact redemption rate the retired Pyth
+# `SUSDE/USDE.RR` feed attested, read directly via the indexer `evm_nav`
+# source (public RPCs, block-pinned, <= 180s old, >= 2 RPCs agree within 10 bps).
+# The value is USDe-quoted; USDe is treated as $1, as before. The drift band
+# (30 bps) absorbs normal USDe/USD noise.
+# Market-leg caveat: sUSDe on Solana has ~$2.4k of DEX liquidity, so the
+# market leg is a GLOBAL sUSDe price, not a Solana-venue price.
+intrinsic      = { kind = "evm_view_nav", contract = "0x9D39A5DE30e57443BfF2A8307A4256c8797A3497", calldata = "0x07a2d13a0000000000000000000000000000000000000000000000000de0b6b3a7640000", decimals = 18, max_divergence_bps = 10, max_block_age_secs = 180 }
 market         = { kind = "pyth_spot", feed = "SUSDE/USD" }   # Pyth spot price (USD-quoted secondary market).
 pyth_feed_id   = "0xca3ba9a619a4b3755c10ac7d5e760275aa95e9823d38a84fedd416856cdba37c"
 thresholds_bps = { drift = 30, depeg = 100, critical = 300 }
@@ -417,8 +419,11 @@ peg_target     = "USD"
 # (read via getAccountInfo + Token-2022 extension decode). No separate share
 # account needed — adapter Task 5 will decode the extension directly.
 intrinsic      = { kind = "solayer_susd_rate", share_account = "susdabGDNbhrnCa6ncrYo81u4s9GM8ecK2UwMyZiq4X", program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb" }
-market         = { kind = "dex_screener_usd" }   # DexScreener top-liquidity pair (Raydium pool ~$8k liquidity)
+market         = { kind = "dex_screener_usd" }   # DexScreener top-liquidity pair
 pyth_feed_id   = ""
+# Monitoring-only (migrations 0071, 0081): NAV live; no Solana market deep
+# enough to price. Its available pair stays below the global liquidity floor,
+# which is deliberately NOT lowered for sUSD.
 # Calibrated 2026-05-25 from 24h p99 ~219 bps — sUSD sits at a sustained
 # negative gap to NAV by design (rebasing Token-2022, thin secondary).
 thresholds_bps = { drift = 275, depeg = 500, critical = 800 }
@@ -483,13 +488,12 @@ peg_target     = "USD"
 #      NAV = total_assets / total_shares ≈ 1.113 at slot 421435319, which
 #      matches Piggybank's published 21% APY × ~7 months live (epoch 105).
 intrinsic      = { kind = "piggybank_pb_vault", vault = "91LYov1N1j62Q3ipuBi8w2e5GVqjVxWTdJ757roiWXdy", program = "Pig1CsXnfDwN1NuoeNRBojohbjc14dogmJCXeb2vL3Y" }
-market         = { kind = "dex_screener_usd" }   # DexScreener top-liquidity pair (Raydium AN4SiMu… ~$65k liquidity)
+market         = { kind = "dex_screener_usd" }   # DexScreener top-liquidity pair
 pyth_feed_id   = ""
 thresholds_bps = { drift = 30, depeg = 100, critical = 250 }
-# Deactivated 2026-06-01 — the only DexScreener pair returned collapsed to a
-# ~$34-liquidity dust pool printing garbage premiums ($1.46/$1.80/$2.34 vs
-# ~$1.10 NAV). The source premium-gate (commit 9fb9104) correctly rejects
-# these, but with no liquid market there is nothing to publish — better to
+# Deactivated 2026-06-01 — the available DexScreener pair no longer supplied
+# a reliable market price. The source premium gate rejects outlying prints,
+# but with no liquid market there is nothing to publish — better to
 # remove pbUSDC from the public universe than show a stale/garbage price.
 # Re-activate when a deep-liquidity market source exists. See migration 0040.
 active         = false
@@ -538,13 +542,19 @@ verified       = true
 decimals       = 6
 token_program  = "spl"
 # Class: yield-bearing LP token. JLP earns from perps fees, funding rate,
-# and pool spread. Intrinsic NAV (Jupiter's official redemption rate) is
-# attested via the dedicated Pyth Redemption Rate feed; secondary market
-# trades on Orca with ~$3M liquidity. Same engine code-path as USDY /
-# sUSDe / syrupUSDC — no new adapter needed.
+# and pool spread. Intrinsic (2026-10-21): read on-chain from the Jupiter
+# Perpetuals Pool account, NAV = pool.aum_usd / JLP supply (both 6dp, one
+# getMultipleAccounts; ~4.63 on 2026-10-21). Replaces the Pyth `JLP/USD.RR`
+# feed (not available on Solana without paid Hermes). A pool whose
+# aum_usd_updated_at is older than 300s is refused. Market leg stays on the
+# Pyth JLP/USD spot feed. Its derivation is not documented by Pyth, and JLP
+# can be minted/redeemed at this NAV through the Perpetuals program, so the
+# market leg is likely arbitrage-coupled to the NAV rather than independent
+# of it; the wide 200 bps drift band is the guard. Jupiter is never polled
+# for JLP (pyth_spot market), so no jupiter_exclude_dexes is set.
 class          = "stable_yield"
 peg_target     = "USD"
-intrinsic      = { kind = "pyth_redemption_rate", feed = "JLP/USD.RR" }
+intrinsic      = { kind = "jupiter_perps_pool_nav", pool = "5BUwFW4nRbftYTDMbgxykoFWqWHPzahFSNAaaaJtVKsq", program = "PERPHjGBqRHArX4DySjwM6UJHiR3sWAatqfdBS2qQJu" }
 market         = { kind = "pyth_spot", feed = "JLP/USD" }
 pyth_feed_id   = "0xc811abc82b4bad1f9bd711a2773ccaa935b03ecef974236942cec5e0eb845a3a"
 # Wider thresholds — JLP is a perps-LP basket, not a peg. Drift band reflects
@@ -564,16 +574,22 @@ decimals       = 6
 token_program  = "spl"
 class          = "stable_fx"          # EUR-pegged, not USD (matches BRZ pattern)
 peg_target     = "EUR"
-# Intrinsic: invert USD/EUR cross. Pyth publishes FX.EUR/USD; with invert=false we use it directly as EUR-per-USD.
-# WEEKEND-DARK (FX feed): the EUR/USD intrinsic is a Pyth FX feed, and forex
+# Intrinsic (2026-10-21): EUR/USD (USD per EUR) as the median of Kraken's
+# EURUSD ticker mid and Coinbase's EUR exchange rate, refused when the two
+# diverge by more than 10 bps or when only one answers. Replaces the Pyth
+# FX.EUR/USD feed (not available on Solana without paid Hermes).
+# WEEKEND-DARK (FX intrinsic): the indexer `fx_http` source deliberately does
+# not publish inside the buffered forex-closed window (Fri 20:30 to Sun 22:30
+# UTC, identical to web/lib/asset/forex.ts), because forex
 # closes Fri ~21:00–22:00 → Sun ~21:00–22:00 UTC (DST-dependent: summer ~21:00,
 # winter ~22:00). With the intrinsic absent the engine can't
 # compute a discount, so it SKIPS the recompute (main.rs H8 path: no
 # discount_snapshots row, pegana_engine_intrinsic_unavailable_total++). The
 # published state does NOT flip to UNKNOWN — it FREEZES at its last value; the
 # H12b sweep only *reports* it stale (observability), it does not change the
-# verdict. Verified live 2026-06-14: rows ran Fri→21:10 UTC, Sat fully dark, Sun
-# resumed ~21:00, last_state stayed PEGGED. Net for the promotion gate: exactly
+# verdict. Verified live 2026-06-14 under the old Pyth feed: rows ran Fri→21:10
+# UTC, Sat fully dark, Sun resumed ~21:00, last_state stayed PEGGED (with the
+# buffered window the dark span is now Fri 20:30 → Sun 22:30). Net for the promotion gate: exactly
 # ONE UTC date per weekend (Saturday) loses all rows — Fri/Sun keep partial-day
 # rows — so days_covered drops by ~1/weekend (NOT 2) and the 7-of-8 gate is
 # usually still reachable (see scripts/calibration-monitor.sql FX caveat).
@@ -586,7 +602,7 @@ peg_target     = "EUR"
 # (web/lib/asset/forex.ts) instead of the alarming stale tone. Remaining nicety =
 # weekend-aware staleness→UNKNOWN for FX intrinsics in the engine (post-06-25
 # lock). No USD-pegged asset has this (feeds are 24/7 crypto).
-intrinsic      = { kind = "pyth_fx_cross", feed = "EUR/USD", invert = false }
+intrinsic      = { kind = "fx_http_median", base = "EUR", quote = "USD", max_divergence_bps = 10 }
 market         = { kind = "jupiter_usd", numeraire = "USDC", numeraire_feed = "USDC/USD" }
 # Mainnet Pyth feed Crypto.EURC/USD confirmed via hermes.pyth.network 2026-05-28.
 pyth_feed_id   = "0x76fa85158bf14ede77087fe3ae472f66213f6ea2f5b411cb2de472794990fa5c"
@@ -720,6 +736,12 @@ intrinsic = { kind = "fixed_1_usd" }
 market = { kind = "pyth_spot", feed = "AUSD/USD" }
 pyth_feed_id = "0xd9912df360b5b7f21a122f15bdd5e27f62ce5e72bd316c291f7c86620e07fb2a"
 thresholds_bps = { drift = 20, depeg = 75, critical = 250 }
+# Retired 2026-10-22 (migration 0081). No Solana market: Jupiter liquidity is
+# about $43, and there is no sponsored Pyth AUSD/USD push feed on Solana (read
+# 2026-10-21: the v2 account last printed 15 days ago, the legacy one 64 days
+# ago). With neither leg live there is nothing honest to publish. The feed is
+# also dropped from [pyth_feeds]; re-add both if a market or a feed appears.
+active = false
 
 [[assets]]
 symbol = "eUSX"
@@ -1296,8 +1318,18 @@ decimals = 6
 token_program = "spl"
 class = "stable_yield"
 peg_target = "USD"
-intrinsic = { kind = "perena_usd_star_nav", reserve = "sM6P4mh53CnG4faN4Fo3seY7wMSAiHdy8o6gKjwQF7A", program = "save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H" }
+# Intrinsic (2026-10-21): Perena migrated USD*; the old reserve sM6P4... is
+# drained and the mint authority is now the bankineco Vault ECJGrTZ6...
+# NAV = vault.accounting.mint_share_price / 1e6 (~1.1047). Liveness is the
+# vault's last_update_ts (crank_nav, ~14 min; engine window 1200s).
+intrinsic = { kind = "perena_vault_nav", vault = "ECJGrTZ6QYMEwiEAnL4oReWF126uc22e9Lojy9qyCjHT", program = "save8RQVPMWNTzU18t3GBvBkN9hT7jsGjiCQ28FpD9H" }
+# Market leg: the only deep Jupiter route is "Perena Star V2", Perena's own
+# share swap, which prices USD* at the vault NAV by construction. It is
+# excluded so it can never stand in for a market; what remains is a thin
+# Whirlpool route that the liquidity gate holds back. USD* stays
+# monitoring-only and reads UNKNOWN until an independent market exists.
 market = { kind = "jupiter_usd", numeraire = "USDC", numeraire_feed = "USDC/USD" }
+jupiter_exclude_dexes = ["Perena Star V2"]
 pyth_feed_id = ""
 thresholds_bps = { drift = 50, depeg = 200, critical = 500 }
 
@@ -1310,36 +1342,30 @@ thresholds_bps = { drift = 50, depeg = 200, critical = 500 }
 "USDC/USD"      = "0xeaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a"
 "USDT/USD"      = "0x2b89b9dc8fdf9f34709a5b106b472f0f39bb6ca9ce04b0fd7f2e971688e2e53b"
 "USD/BRL"       = "0xd2db4dbf1aea74e0f666b0e8f73b9580d407f5e5cf931940b06dc633d7a95906"
-# Ondo USDY redemption-rate (NAV) feed — issuer-attested, see USDY block above.
-"USDY/USD.RR"   = "0xe3d1723999820435ebab53003a542ff26847720692af92523eea613a9a28d500"
 # Maple syrupUSDC redemption-rate (NAV vs USDC) — issuer-attested, see syrupUSDC block above.
 "SYRUPUSDC/USDC.RR" = "0x2ad31d1c4a85fbf2156ce57fab4104124c5ef76a6386375ecfc8da1ed5ce1486"
-# Ethena sUSDe redemption-rate (NAV vs USDE) — issuer-attested, see sUSDe block above.
-"SUSDE/USDE.RR" = "0x271c64ce459937abf721d42552035713b6c58f80eeceab716a624607fda4b10f"
 # OnRe ONyc NAV (Pyth "Crypto NAV" type, USD-denominated) — issuer-attested, see ONyc block above.
 "ONYC/USD.NAV" = "0xbabbfcc7f46b6e7df73adcccece8b6782408ed27c4e77f35ba39a449440170ab"
 # Spot/secondary-market Pyth feeds for yield-bearing stables — consumed by
 # the pyth.rs source's spot-market routing as `market_usd` for the assets
 # above. Pegana then computes discount = 1 − spot ÷ NAV per asset.
-"USDY/USD"       = "0xe393449f6aff8a4b6d3e1165a7c9ebec103685f3b41e60db4277b5b6d10e7326"
+# "USDY/USD" dropped 2026-10-22: USDY market moved to jupiter_usd (migration 0081).
 "SUSDE/USD"      = "0xca3ba9a619a4b3755c10ac7d5e760275aa95e9823d38a84fedd416856cdba37c"
 "SYRUPUSDC/USD"  = "0xe616297dab48626eaacf6d030717b25823b13ae6520b83f4735bf8deec8e2c9a"
 
 # Trust Layer v0.1.0 Phase 0 additions (mainnet, confirmed via hermes.pyth.network 2026-05-28).
 "JUPUSD/USD"     = "0x8ed858a2214e892c9371694fb6c8a9037b6ed4052c4edf209f8cb988484e81d9"
 "EURC/USD"       = "0x76fa85158bf14ede77087fe3ae472f66213f6ea2f5b411cb2de472794990fa5c"
-"EUR/USD"        = "0xa995d00bb36a63cef7fd2c287dc105fc8f3d93779f062f09551b0af3e81ec30b"
 
 # Trust Layer v0.1.0 Phase 0b addition (2026-05-29) — JLP closes the major
 # yield-bearing gap that the original Phase 0 commit silently dropped.
 # Same code-path as USDY/syrupUSDC/sUSDe/ONyc — pyth.rs handles RR + spot.
-"JLP/USD.RR"     = "0x6704952e00b6a088b6dcdb8170dcd591eaf64cff9e996ca75ae0ca55bfb96687"
 "JLP/USD"        = "0xc811abc82b4bad1f9bd711a2773ccaa935b03ecef974236942cec5e0eb845a3a"
 "USX/USD"     = "0x80950327494d0e7f29bdddb061ed7d1def1d712cec73bc167af02f0664137a16"
 "USDG/USD"    = "0xdaa58c6a3ce7d4b9c46c32a6e646012c17c4a2b24c08dd8c5e476118b855a7da"
 "USD1/USD"    = "0x0a2425d43486780990d8b63543029e20556be51fd756cca584212f4d539611d4"
 "USDu/USD"    = "0x9c26b01925ed603f7c90deb29cd88751c580436333a7dca20a64a2c63785f502"
-"AUSD/USD"    = "0xd9912df360b5b7f21a122f15bdd5e27f62ce5e72bd316c291f7c86620e07fb2a"
+# "AUSD/USD" dropped 2026-10-22 with the AUSD retirement (no sponsored push feed on Solana).
 "EUSX/USX.RR" = "0xf36e12e65d2969b242fb97d3ebaa32ec55d5794189b64d1a07dc4f41425c9378"
 "PST/USDC.RR" = "0x675e36f84a6be779ed793c71eb5c03151e1866c125767f46933626e0610af84d"
 
@@ -1362,7 +1388,7 @@ thresholds_bps = { drift = 50, depeg = 200, critical = 500 }
 
 [polling]
 sanctum_poll_ms      = 15000   # batch call for all LSTs at once
-jupiter_tick_ms      = 2500    # 0.4 RPS × concurrency=1 keeps us under the 0.5 RPS keyless budget; ~50s per asset across the ~19 jupiter-backed slots
+jupiter_tick_ms      = 2500    # 0.4 RPS × concurrency=1 keeps us under the 0.5 RPS keyless budget; one asset per tick across the ~61 jupiter-backed slots at concurrency=1 (a full cycle ≈ 150s; raise JUPITER_MAX_CONCURRENT to shorten it). The dark-market window is derived from this cycle, not fixed
 hylo_onchain_poll_ms = 30000
 piggybank_poll_ms    = 60000   # NAV only changes at 48h epoch boundaries
 pyth_stream_reconnect_backoff_max_ms = 30000
@@ -1386,9 +1412,23 @@ default_secs = 30
 # spot feed (the pre-fix bug) left the `.RR` intrinsic on the 30s default →
 # stale >600s for ~23h/day after each daily Ondo push → USDY verdict frozen at
 # UNKNOWN most of the day. Every sibling below correctly keys its `.RR`/`.NAV`.
-"USDY/USD.RR"        = 129600   # 36h — daily Ondo NAV step (intrinsic redemption rate)
-"SUSDE/USDE.RR"       = 129600   # 36h — daily Ethena redemption rate
 "SYRUPUSDC/USDC.RR"   = 129600   # 36h — daily Maple redemption rate
 "ONYC/USD.NAV"        = 604800   # 7d  — weekly Ondo NAV step
 "EUSX/USX.RR" = 129600
 "PST/USDC.RR" = 129600
+# Slow-heartbeat spot feeds on the post-upgrade push program (2026-10-22).
+# These feeds are NOT on Pyth's documented Solana sponsored list (documented
+# default: 55s heartbeat / 0.5% deviation), so their cadence was MEASURED on
+# mainnet over ~35 min of 30s samples: PYUSD/USD resets at ~1160-1170s age
+# (heartbeat ~1200s); SUSDE/USD, USX/USD and USDS/USD peak at 259-282s
+# (~300s); USDG/USD peaks at 213s (~240s). Every other configured feed stayed
+# under 50s. Each window is ~1.5x heartbeat plus the 12s poll, so a print one
+# heartbeat old still yields a real confidence label while a feed that misses
+# a heartbeat and a half reads stale. The global default (30s) and the
+# on-chain floor (PYTH_ONCHAIN_STALENESS_SECS, 120s) are unchanged; the
+# engine's verdict freshness floor for pyth_spot markets stays 600s.
+"PYUSD/USD" = 1800   # ~1200s heartbeat; cross-check only (PYUSD's market is jupiter_usd)
+"SUSDE/USD" = 450    # ~300s heartbeat; sUSDe pyth_spot market leg
+"USX/USD"   = 450    # ~300s heartbeat; USX pyth_spot market leg
+"USDS/USD"  = 450    # ~300s heartbeat; cross-check only
+"USDG/USD"  = 360    # ~240s heartbeat; USDG pyth_spot market leg

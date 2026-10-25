@@ -30,11 +30,15 @@ jobs:
   plan:
     name: Plan release
     runs-on: ubuntu-latest
+    # The only job bound to the `release` environment (required reviewer).
+    # `build` and `release` depend on `plan`, so one approval per tag gates the
+    # whole pipeline instead of three prompts.
+    environment: release
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with: { submodules: recursive }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { submodules: recursive, persist-credentials: false }
 
       - name: Install dist
         run: |
@@ -54,7 +58,7 @@ jobs:
         run: dist plan --output-format=json > plan.json
 
       - name: Upload plan artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: plan
           path: plan.json
@@ -78,8 +82,8 @@ jobs:
       id-token: write       # OIDC — Sigstore signing, no key material
       attestations: write   # attest-build-provenance writes the bundle
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
-        with: { submodules: recursive }
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { submodules: recursive, persist-credentials: false }
 
       # SHA-pinned like every other step. The previous `@1.90` form relied on
       # a moving branch, which is exactly the tj-actions/changed-files failure
@@ -88,7 +92,7 @@ jobs:
       # not freeze the TOOLCHAIN — `toolchain:` is resolved at run time, so we
       # still get the latest 1.90.x patch release.
       # Required by the repo's sha_pinning_required Actions policy.
-      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master @ 2026-07-30
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master @ 2026-10-16
         with:
           toolchain: "1.90"
 
@@ -111,17 +115,24 @@ jobs:
         shell: bash
         run: dist build --target ${{ matrix.target }} --artifacts=local
 
-      # Sigstore attestation — issues a signed provenance statement
-      # binding the binary's sha256 to this workflow's OIDC identity
-      # (github.com/PeganaHQ/ReplayCLI). install.sh later verifies
-      # this via `gh attestation verify` (ADR-0008).
-      - name: Sigstore attest binaries
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+      # The installer verifies the archive as the attested subject before
+      # extracting or installing its contents. The bare binary is attested too
+      # so a binary extracted by hand can still be checked (ADR-0008).
+      - name: Sigstore attest archives
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
-            target/distrib/pegana-replay-*
+            target/distrib/pegana-replay-*.tar.xz
+            target/distrib/pegana-replay-*/pegana-replay
 
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+      # Ship the bundle next to the archive so the installer can verify with
+      # no GitHub credentials (`gh attestation verify --bundle`).
+      - name: Save attestation bundle
+        shell: bash
+        run: cp "${{ steps.attest.outputs.bundle-path }}" "target/distrib/pegana-replay-${{ matrix.target }}.tar.xz.sigstore.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: artifacts-${{ matrix.target }}
           path: target/distrib/
@@ -133,9 +144,11 @@ jobs:
     permissions:
       contents: write       # gh release create/upload — nothing else needs this
     steps:
-      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: artifacts-*
           merge-multiple: true
@@ -154,11 +167,11 @@ jobs:
           # unpacked staging dir (pegana-replay-cli-<target>/) next to the
           # .tar.xz in target/distrib/, so a bare ./dist/* glob would try to
           # upload a directory and fail ("is a directory"). The two extension
-          # globs don't overlap: *.tar.xz excludes *.tar.xz.sha256.
+          # globs don't overlap: *.tar.xz excludes the .sha256 and .sigstore.json sidecars.
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" ./dist/*.tar.xz ./dist/*.tar.xz.sha256 --clobber
+            gh release upload "$TAG" ./dist/*.tar.xz ./dist/*.tar.xz.sha256 ./dist/*.tar.xz.sigstore.json --clobber
           else
-            gh release create "$TAG" ./dist/*.tar.xz ./dist/*.tar.xz.sha256 \
+            gh release create "$TAG" ./dist/*.tar.xz ./dist/*.tar.xz.sha256 ./dist/*.tar.xz.sigstore.json \
               --title "$TAG" \
               --generate-notes \
               --verify-tag

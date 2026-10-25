@@ -36,7 +36,7 @@ name        = "pegana-replay"
 # still embeds methodology 0.7.0 (exact-match per ADR-0028), so 0.5.1 and 0.5.2
 # verify exactly the same receipts. Cut as 0.5.2 rather than re-tagging 0.5.1
 # because 0.5.1 is already published to crates.io WITHOUT --json.
-version     = "0.5.2"
+version     = "0.6.0"
 edition     = "2021"
 description = "Recomputes a Pegana alert receipt's canonical SHA-256 and, by default, cross-checks its on-chain SPL Memo anchor against a pinned signer (skip via --offline); re-derives the verdict from frozen inputs for schema-v2 receipts."
 license     = "MIT"
@@ -54,14 +54,16 @@ name = "pegana-replay"
 path = "src/main.rs"
 
 [dependencies]
-pegana-methodology   = { path = "../methodology", version = "0.7.0" }
+pegana-methodology   = { path = "../methodology", version = "0.8.0" }
 # Public carve-out (replaces pegana-common). The replay CLI only touches the
 # verifier-safe types (AssetsFile parsing, AlertEvidence deserialization);
 # server-side primitives stay in the closed pegana-common crate.
-pegana-common-verify = { path = "../common-verify", version = "0.1.0" }
+pegana-common-verify = { path = "../common-verify", version = "0.1.1" }
 clap               = { version = "4", features = ["derive", "env"] }
 reqwest            = { workspace = true }
 serde_json         = { workspace = true }
+rust_decimal       = { workspace = true }
+toml               = { workspace = true }
 tokio              = { workspace = true, features = ["rt-multi-thread", "macros"] }
 anyhow             = { workspace = true }
 uuid               = { workspace = true }
@@ -73,8 +75,6 @@ solana-transaction-status = "2"
 [dev-dependencies]
 tempfile     = "3"
 chrono       = { workspace = true }
-rust_decimal = { workspace = true }
-toml         = { workspace = true }
 tokio        = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock     = "0.6"
 # Test-only: builds a real EncodedConfirmedTransactionWithStatusMeta fixture
