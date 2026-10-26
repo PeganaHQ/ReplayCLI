@@ -36,10 +36,10 @@ name        = "pegana-replay"
 # still embeds methodology 0.7.0 (exact-match per ADR-0028), so 0.5.1 and 0.5.2
 # verify exactly the same receipts. Cut as 0.5.2 rather than re-tagging 0.5.1
 # because 0.5.1 is already published to crates.io WITHOUT --json.
-version     = "0.6.0"
+version     = "0.6.1"
 edition     = "2021"
 description = "Recomputes a Pegana alert receipt's canonical SHA-256 and, by default, cross-checks its on-chain SPL Memo anchor against a pinned signer (skip via --offline); re-derives the verdict from frozen inputs for schema-v2 receipts."
-license     = "MIT"
+license     = "FSL-1.1-MIT"
 repository  = "https://github.com/PeganaHQ/ReplayCLI"
 keywords    = ["pegana", "audit", "verify", "solana"]
 categories  = ["command-line-utilities"]

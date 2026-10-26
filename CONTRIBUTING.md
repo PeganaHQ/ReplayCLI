@@ -1,7 +1,7 @@
 # Contributing
 
 This repo is the **verifier subset** of [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana),
-the Pegana repository, whose verifier subset is MIT-licensed. It is **mirrored automatically**: a sync pull request
+the Pegana repository, whose verifier subset is Fair Source (FSL-1.1-MIT with the Pegana Verification Permission). It is **mirrored automatically**: a sync pull request
 copies `crates/methodology/`, `crates/pegana-replay-cli/`, `crates/common-verify/` and
 `assets.toml` here. A change made only in this repo is overwritten by the next sync, so changes
 land upstream first.
@@ -48,5 +48,7 @@ please report it privately before any public disclosure: see [SECURITY.md](SECUR
 
 ## License
 
-By contributing you agree your changes are released under MIT (matching
-`LICENSE` at repo root).
+By contributing you agree your changes are released under the license of the
+crate you change (FSL-1.1-MIT with the Pegana Verification Permission for the
+methodology and verifier; MIT for `crates/common-verify`), matching `LICENSE`
+at repo root.

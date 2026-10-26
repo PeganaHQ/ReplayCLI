@@ -9,7 +9,7 @@
   <a href="https://crates.io/crates/pegana-replay"><img alt="crates.io" src="https://img.shields.io/crates/v/pegana-replay.svg?logo=rust"></a>
   <a href="https://github.com/PeganaHQ/ReplayCLI/actions/workflows/release.yml"><img alt="Release" src="https://github.com/PeganaHQ/ReplayCLI/actions/workflows/release.yml/badge.svg"></a>
   <a href="https://scorecard.dev/viewer/?uri=github.com/PeganaHQ/ReplayCLI"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/PeganaHQ/ReplayCLI/badge"></a>
-  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <a href="LICENSE"><img alt="License: FSL-1.1-MIT" src="https://img.shields.io/badge/license-FSL--1.1--MIT-blue.svg"></a>
   <img alt="MSRV" src="https://img.shields.io/badge/rustc-1.90+-orange.svg">
 </p>
 
@@ -128,7 +128,7 @@ Note `4` vs `5`: a severe transition with no anchor reports `ONCHAIN_INCOMPLETE`
 **Not here:** the engine, dispatcher, indexers, API, MCP server and on-chain commit
 pipeline. They are source-available under FSL-1.1-MIT in the oracle repository
 [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana). The `web/` app is proprietary.
-The methodology, verifier and SDKs are MIT-licensed. This repo is the verifier subset,
+The methodology and verifier are Fair Source (FSL-1.1-MIT, with the Pegana Verification Permission); the SDKs are MIT. This repo is the verifier subset,
 mirrored from it so you can audit and build the CLI without the rest of the stack, and
 **every decision the engine produces is reproducible from this repo** against the alert's receipt.
 
@@ -191,7 +191,9 @@ this repo.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+Fair Source (FSL-1.1-MIT): read, run, modify and verify freely, including commercially, with the Pegana Verification Permission; each release becomes MIT two years after it ships. SDKs are MIT.
+
+See [LICENSE](LICENSE) and [VERIFICATION-PERMISSION.md](VERIFICATION-PERMISSION.md). `crates/common-verify` stays MIT. Published versions pegana-methodology <= 0.8.0 and pegana-replay <= 0.6.0 remain MIT.
 
 ## Links
 
