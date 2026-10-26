@@ -38,7 +38,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 # solana — required by replay-cli for --verify-onchain. Uses solana-rpc-client
 # (not the monolithic solana-client) to match the private workspace and keep the
 # rustls 0.21 / webpki 0.101 / quinn paths out of the graph.
-solana-rpc-client = "2.0"
+solana-rpc-client = "4.2"
 solana-sdk = "2.0"
 
 [profile.release]
