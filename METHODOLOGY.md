@@ -1,5 +1,7 @@
 # Pegana methodology — v0.8.0
 
+> The text of this specification stays readable by everyone. The code it describes is Fair Source (FSL-1.1-MIT with the Pegana Verification Permission).
+
 How peg-risk signals are produced, why this design over the obvious
 alternatives, and what every load-bearing piece of the math is doing.
 
@@ -37,7 +39,7 @@ per-asset-class thresholds, EWMA smoothing, and hysteresis — see
 Every state transition produces a **content-addressed receipt**:
 a hash over the canonical inputs the methodology saw, the values
 it computed, and the methodology version that produced the decision.
-Anyone can replay that receipt offline using the open-source
+Anyone can replay that receipt offline using the Fair Source
 `pegana-replay` binary in this repo — see the [Verifiability](#verifiability)
 section. State transitions also commit the receipt's sha256 to Solana
 mainnet via SPL Memo, so the timing of the decision is independently
