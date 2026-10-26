@@ -1,7 +1,7 @@
 # Contributing
 
 This repo is the **verifier subset** of [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana),
-the open-source (MIT) Pegana repository. It is **mirrored automatically**: a sync pull request
+the Pegana repository, whose verifier subset is MIT-licensed. It is **mirrored automatically**: a sync pull request
 copies `crates/methodology/`, `crates/pegana-replay-cli/`, `crates/common-verify/` and
 `assets.toml` here. A change made only in this repo is overwritten by the next sync, so changes
 land upstream first.

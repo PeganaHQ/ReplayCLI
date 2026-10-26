@@ -470,7 +470,7 @@ A few things this design explicitly does not do, with reasons:
 | [`assets.toml`](assets.toml) | Canonical asset list. Hashed into every receipt. |
 | [`docs/adr/`](https://github.com/PeganaHQ/Pegana/tree/main/docs/adr) (upstream, not mirrored here) | ADRs that decided each load-bearing methodology choice, dated and rationalised. |
 
-The engine that runs this methodology in production (open source under MIT in the
+The engine that runs this methodology in production (source-available under FSL-1.1-MIT in the
 oracle repository [PeganaHQ/Pegana](https://github.com/PeganaHQ/Pegana), outside this
 verifier subset) is
 **not** in scope for this document. What that engine
